@@ -88,7 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user_to_db(chat_id, username, thread_id)
 
     # Send greeting message to the user
-    await update.message.reply_text(f"Hello {username}! How can I assist you today?")
+    await update.message.reply_text(f"Hello {username}👋,\nHow can I assist you today?")
 
 # Message handler for forwarding user messages to the respective thread in the group
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
