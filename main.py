@@ -302,22 +302,26 @@ def webhook_handler_route():
     if not json_data:
         logger.warning("Received empty JSON in webhook")
         return "Empty request", 400
-    # logger.debug(f"Webhook received: {json_data}") # Can be very verbose
+    # logger.debug(f"Webhook received: {json_data}")
     update = Update.de_json(json_data, application.bot)
 
-    # PTB's application.process_update should ideally handle its own asyncio loop context
-    # However, when called from a sync function (Flask route), ensuring loop is correct:
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:  # No running loop in this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    # Schedule the processing in the event loop
-    # Using create_task allows Flask to return 'OK' faster to Telegram.
-    # If process_update is quick, run_until_complete is also fine.
-    loop.create_task(application.process_update(update))
-    # loop.run_until_complete(application.process_update(update)) # Alternative
+    if application.loop:
+        # Submit the process_update coroutine to the main PTB event loop
+        future = asyncio.run_coroutine_threadsafe(application.process_update(update), application.loop)
+        try:
+            # It's good practice to see if the task was accepted,
+            # but for webhooks, you usually return "OK" quickly.
+            # You could add a short timeout if you want to ensure it started processing.
+            # future.result(timeout=1) # Example: wait up to 1 second for the task to be scheduled/start
+            pass # Returning "OK" quickly is typical for webhooks
+        except Exception as e:
+            logger.error(f"Error when submitting process_update to event loop: {e}")
+            # Consider returning an error to Telegram if submission fails critically
+            # return "Error processing update", 500
+    else:
+        logger.error("PTB application event loop not available for webhook processing. Update may not be handled.")
+        # This indicates a potential issue with application initialization or lifecycle.
+        return "Internal server error: Bot loop not ready", 500
 
     return "OK", 200
 
