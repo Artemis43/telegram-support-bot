@@ -2,21 +2,20 @@ import os
 import logging
 import sqlite3
 import asyncio
-import requests # Keep requests if you need it for other things, not strictly for PTB webhook setting in this version
+import requests
 import threading
 from flask import Flask, request
-from telegram import Update # Bot, ForumTopic might not be needed directly at the top level
+from telegram import Update, Bot, ForumTopic
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import NetworkError, BadRequest
 
 # Load environment variables
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GROUP_ID = int(os.getenv('TELEGRAM_GROUP_ID'))
-ADMIN_USER_IDS = [int(admin_id.strip()) for admin_id in os.getenv('TELEGRAM_ADMINS', '').split(',') if admin_id.strip()]
-PORT = int(os.getenv('PORT', "8443"))
-WEBSITE_URL = os.getenv('WEBSITE_URL')
+GROUP_ID = int(os.getenv('TELEGRAM_GROUP_ID')) # Ensure GROUP_ID is an integer
+ADMIN_USER_IDS = [int(admin_id.strip()) for admin_id in os.getenv('TELEGRAM_ADMINS', '').split(',') if admin_id.strip()] # Ensure ADMINS are integers
+PORT = int(os.getenv('PORT', "8443")) # Default to 8443 if not set
+WEBSITE_URL = os.getenv('WEBSITE_URL') # e.g., https://your-app-name.on-render.com
 
-# Critical environment variable checks
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
 if not GROUP_ID:
@@ -26,7 +25,8 @@ if not WEBSITE_URL:
 if not ADMIN_USER_IDS:
     logging.warning("TELEGRAM_ADMINS environment variable not set or empty. Admin-specific functions might not work as expected.")
 
-# Initialize Flask app - Gunicorn will look for this 'app' object
+
+# Initialize Flask app
 app = Flask(__name__)
 
 # Logging configuration
@@ -36,28 +36,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Global variables for PTB ---
-ptb_application = Application.builder().token(TOKEN).build()
-PTB_EVENT_LOOP = None  # This will store the single event loop for PTB
-PTB_THREAD = None
-PTB_INITIALIZED_EVENT = threading.Event() # To signal when PTB_EVENT_LOOP is ready
+# Initialize Telegram bot application
+application = Application.builder().token(TOKEN).build()
+PTB_EVENT_LOOP = None # Global variable to store the PTB event loop
 
 # --- Database Functions ---
 DB_NAME = 'bot_data.db'
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False) # check_same_thread=False for SQLite with threads
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users
-                     (chat_id INTEGER PRIMARY KEY, username TEXT, thread_id INTEGER UNIQUE)''')
+                     (chat_id INTEGER PRIMARY KEY, username TEXT, thread_id INTEGER UNIQUE)''') # thread_id should be unique
     conn.commit()
     conn.close()
-    logger.info("Database initialized (or already exists).")
+    logger.info("Database initialized.")
 
 def save_user_to_db(chat_id: int, username: str, thread_id: int):
     try:
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
+        # Use INSERT OR REPLACE to handle cases where user might /start again (though we try to prevent new topic creation)
         cursor.execute('INSERT OR REPLACE INTO users (chat_id, username, thread_id) VALUES (?, ?, ?)',
                        (chat_id, username, thread_id))
         conn.commit()
@@ -70,7 +69,7 @@ def save_user_to_db(chat_id: int, username: str, thread_id: int):
 
 def get_user_chat_id(thread_id: int) -> int | None:
     try:
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute('SELECT chat_id FROM users WHERE thread_id=?', (thread_id,))
         result = cursor.fetchone()
@@ -84,7 +83,7 @@ def get_user_chat_id(thread_id: int) -> int | None:
 
 def get_user_thread(chat_id: int) -> int | None:
     try:
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute('SELECT thread_id FROM users WHERE chat_id=?', (chat_id,))
         result = cursor.fetchone()
@@ -97,68 +96,98 @@ def get_user_thread(chat_id: int) -> int | None:
             conn.close()
 
 # --- Webhook Setup ---
-async def set_webhook_async(): # Renamed to avoid conflict if there was a non-async one
-    global ptb_application
+async def set_webhook():
     webhook_url = f"{WEBSITE_URL}/webhook/{TOKEN}"
     try:
-        bot = ptb_application.bot
-        await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-        logger.info(f"Webhook set successfully: {webhook_url}")
-    except NetworkError as e:
+        response = requests.get(f'https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}&drop_pending_updates=True')
+        response.raise_for_status() # Raise an exception for HTTP errors
+        if response.json().get("ok"):
+            logger.info(f"Webhook set successfully: {webhook_url}")
+        else:
+            logger.error(f"Failed to set webhook: {response.text}")
+    except requests.exceptions.RequestException as e:
         logger.error(f"Network error while setting webhook: {e}")
     except Exception as e:
-        logger.error(f"An unexpected error occurred during set_webhook_async: {e}")
+        logger.error(f"An unexpected error occurred during set_webhook: {e}")
 
-# --- Command Handlers & Message Handlers (use global ptb_application) ---
+
+# --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     chat_id = update.message.chat_id
-    username = user.username or user.first_name
+    username = user.username or user.first_name # Use first_name if username is not set
 
+    # Check if user already has an active topic
     existing_thread_id = get_user_thread(chat_id)
     if existing_thread_id:
         try:
             await update.message.reply_text(
-                f"Hello {username}👋,\nHow can I assist you today?"
+                f"Hello {username}👋,\nI'm already assisting you. Please continue sending your messages here, "
+                f"and they will appear in your dedicated support topic in our group."
             )
-            # Removed redundant message to group topic for existing user on /start
+            # Optionally, notify the existing topic
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                text=f"User {username} (Chat ID: {chat_id}) interacted with /start again.",
+                message_thread_id=existing_thread_id
+            )
         except BadRequest as e:
-            logger.error(f"Error informing user about existing session for {chat_id}: {e}")
+            logger.error(f"Error informing user/topic about existing session for {chat_id}: {e}")
         return
 
-    topic_name = f"Support: {username} ({user.id})"
+    # Create a unique topic name
+    topic_name = f"Support: {username} ({user.id})" # Using user.id ensures uniqueness even if username changes
+
     try:
-        forum_topic = await context.bot.create_forum_topic(chat_id=GROUP_ID, name=topic_name)
+        # Create a new forum topic/thread for the user in the group
+        logger.info(f"Attempting to create forum topic '{topic_name}' in group {GROUP_ID}")
+        forum_topic: ForumTopic = await context.bot.create_forum_topic(chat_id=GROUP_ID, name=topic_name)
         thread_id = forum_topic.message_thread_id
+
+        logger.info(f"ForumTopic object created: {forum_topic}")
+        logger.info(f"Thread ID for user {username} ({chat_id}): {thread_id}")
+
         if not thread_id:
-            logger.error(f"Failed to create or retrieve valid thread_id for topic: {topic_name}.")
-            await update.message.reply_text("Sorry, I couldn't set up a support channel. Try again later.")
+            logger.error(f"Failed to create or retrieve valid thread_id for topic: {topic_name}. ForumTopic response: {forum_topic}")
+            await update.message.reply_text("Sorry, I couldn't set up a support channel for you at the moment. Please try again later.")
             return
+
         save_user_to_db(chat_id, username, thread_id)
+
         await update.message.reply_text(
-            f"Hello {username}👋,\nHow can I assist you today?"
+            f"Hello {username}👋,\nHow can I assist you today? "
         )
+        # Send an initial message to the newly created topic from the bot
         await context.bot.send_message(
             chat_id=GROUP_ID,
-            text=f"New support session: {username} (Chat ID: {chat_id}, User ID: {user.id}).",
+            text=f"New support session started for user: {username} (Chat ID: {chat_id}, User ID: {user.id}).\n"
+                 f"Please use this topic to communicate with them.",
             message_thread_id=thread_id
         )
-    except BadRequest as e:
-        logger.error(f"BadRequest creating topic for {username} ({chat_id}): {e}.")
-        await update.message.reply_text("Error setting up support channel. Contact admin.")
-    except Exception as e:
-        logger.error(f"Unexpected error in start for {username} ({chat_id}): {e}", exc_info=True)
-        await update.message.reply_text("Unexpected error starting session. Try again.")
 
+    except BadRequest as e:
+        logger.error(f"BadRequest while creating forum topic for {username} ({chat_id}): {e}. "
+                     f"Ensure the bot is admin in a 'forum' group (topics enabled) and has 'manage_topics' permission.")
+        await update.message.reply_text("I encountered an issue setting up your support channel. Please ensure the bot is configured correctly in the support group. You might need to contact an administrator directly.")
+    except Exception as e: # Catch any other unexpected errors
+        logger.error(f"An unexpected error occurred in start for {username} ({chat_id}): {e}", exc_info=True)
+        await update.message.reply_text("An unexpected error occurred while starting our session. Please try again in a few moments.")
+
+# --- Message Handlers ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
+    # This handler is for messages from users in private chat
+    if not update.message: # Can happen with channel_post_updates etc.
+        return
+
     chat_id = update.message.chat_id
     user = update.message.from_user
-    # username = user.username or user.first_name # Not strictly needed here
+    username = user.username or user.first_name
+
     thread_id = get_user_thread(chat_id)
 
     if not thread_id:
-        await update.message.reply_text("No active session. Use /start.")
+        logger.warning(f"No thread ID found for user {username} ({chat_id}). They might need to /start first.")
+        await update.message.reply_text("I don't have an active support session for you. Please use the /start command to begin.")
         return
 
     try:
@@ -177,22 +206,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_audio(chat_id=GROUP_ID, audio=update.message.audio.file_id, caption=update.message.caption, message_thread_id=thread_id)
         # Add other media types as needed (sticker, video_note, etc.)
         else:
-            await update.message.reply_text("This message type cannot be forwarded at the moment.") # Fallback
+            logger.info(f"Received unhandled message type from {username} ({chat_id})")
+            await update.message.reply_text("I can currently only forward text, photos, videos, and documents.")
+            return # Don't confirm if not forwarded
+        # Optionally, confirm to user message was forwarded (can be spammy)
+        # await update.message.reply_text("Your message has been forwarded to the support team.")
+
     except BadRequest as e:
-        logger.error(f"BadRequest sending user message from {chat_id} to thread {thread_id}: {e}")
-        await update.message.reply_text("Issue sending message. Try again.")
+        logger.error(f"BadRequest: Failed to send message from user {chat_id} to thread {thread_id}: {e}")
+        await update.message.reply_text("Sorry, there was an issue sending your message. Please try again.")
     except Exception as e:
-        logger.error(f"Error handling message from {chat_id} to {thread_id}: {e}", exc_info=True)
-        await update.message.reply_text("Unexpected error sending message.")
+        logger.error(f"Error handling message from user {chat_id} to thread {thread_id}: {e}", exc_info=True)
+        await update.message.reply_text("An unexpected error occurred. Please try sending your message again.")
+
 
 async def forward_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This handler is for messages from admins in the group, within a topic
     if not update.message or not update.message.is_topic_message or not update.message.message_thread_id:
+        # Ignore messages not in topics or general topic messages if not replies to bot's topic structure
+        # logger.debug("Ignoring non-topic message or message without thread_id in group.")
         return
+
     message = update.message
+    admin_user = message.from_user
+    admin_username = admin_user.username or admin_user.first_name
+
+    # Check if the message is from a designated admin (optional, good for strictness)
+    # if admin_user.id not in ADMIN_USER_IDS:
+    #     logger.debug(f"Message in group topic {message.message_thread_id} from non-admin {admin_username} ({admin_user.id}). Ignoring.")
+    #     return
+
     thread_id = message.message_thread_id
     user_chat_id = get_user_chat_id(thread_id)
 
     if not user_chat_id:
+        logger.warning(f"No user found for thread ID: {thread_id} from admin {admin_username}. Possibly an old topic or direct message in topic.")
+        # Optionally reply to the admin in the topic:
+        # await message.reply_text("Could not find the original user for this topic. Was this topic created by the bot?")
         return
 
     try:
@@ -210,151 +260,157 @@ async def forward_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_audio(chat_id=user_chat_id, audio=message.audio.file_id, caption=message.caption)
         # Add other media types as needed
         else:
-            # logger.info(f"Admin sent unhandled message type to user for thread {thread_id}")
+            logger.info(f"Admin {admin_username} sent unhandled message type to user for thread {thread_id}")
             await message.reply_text("This message type cannot be forwarded to the user at this time.")
-    except BadRequest as e:
-        logger.error(f"BadRequest sending admin message from thread {thread_id} to user {user_chat_id}: {e}")
-        await message.reply_text(f"Failed to send to user. Error: {e.message}")
-    except Exception as e:
-        logger.error(f"Error forwarding admin message from {thread_id} to {user_chat_id}: {e}", exc_info=True)
-        await message.reply_text("Unexpected error sending to user.")
 
+
+    except BadRequest as e:
+        logger.error(f"BadRequest: Failed to send admin message from thread {thread_id} to user {user_chat_id}: {e}")
+        await message.reply_text(f"Failed to send your message to the user. Error: {e.message}") # Inform admin
+    except Exception as e:
+        logger.error(f"Error forwarding admin message from thread {thread_id} to user {user_chat_id}: {e}", exc_info=True)
+        await message.reply_text("An unexpected error occurred while trying to send your message to the user.")
+
+
+# --- Error Handler ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    # For specific errors, you might want to inform the user if the update object is available
     if isinstance(update, Update) and update.effective_message:
         try:
+            # Avoid sending error messages for some known issues, e.g. if a user blocks the bot
             if isinstance(context.error, BadRequest) and "bot was blocked by the user" in str(context.error).lower():
-                logger.warning(f"Bot was blocked by user {update.effective_chat.id if update.effective_chat else 'N/A'}.")
-                return
-            # Consider removing automatic error reply to user or making it very generic
-            # await update.effective_message.reply_text("An error occurred.")
+                logger.warning(f"Bot was blocked by user {update.effective_chat.id if update.effective_chat else 'N/A'}. Cannot send message.")
+                return # Don't try to send a message back
+
+            # await update.effective_message.reply_text(
+            #     "Sorry, an unexpected error occurred. The developers have been notified."
+            # )
         except Exception as e:
             logger.error(f"Exception in error_handler while trying to inform user: {e}")
 
-# --- PTB Async Setup and Run Logic (to be run in the dedicated thread) ---
-async def ptb_initial_setup_and_run():
-    global ptb_application
 
-    logger.info("PTB Async Setup: Initializing database...")
-    init_db() # Ensure this is thread-safe for SQLite if called from multiple Gunicorn workers without --preload
+# --- Flask Webserver for Webhook ---
+@app.route('/keep_alive', methods=['GET'])
+def keep_alive():
+    return "Bot is running!", 200
 
-    logger.info("PTB Async Setup: Adding handlers...")
-    ptb_application.add_handler(CommandHandler("start", start))
-    user_message_filters = (
-        filters.ChatType.PRIVATE & ~filters.COMMAND &
-        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO)
-    )
-    ptb_application.add_handler(MessageHandler(user_message_filters, handle_message))
-
-    if ADMIN_USER_IDS:
-        admin_message_filters = (
-            filters.Chat(GROUP_ID) & filters.User(user_id=ADMIN_USER_IDS) & ~filters.COMMAND &
-            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO) &
-            filters.UpdateType.MESSAGE
-        )
-        ptb_application.add_handler(MessageHandler(admin_message_filters, forward_admin_message))
-    ptb_application.add_error_handler(error_handler)
-
-    logger.info("PTB Async Setup: Initializing PTB application...")
-    await ptb_application.initialize() # Initializes bot, updater, etc.
-    logger.info("PTB Async Setup: Telegram Application initialized.")
-
-    logger.info("PTB Async Setup: Setting webhook...")
-    await set_webhook_async()
-
-    logger.info("PTB Async Setup: Complete. PTB ready for updates via webhook.")
-    # The event loop will be kept running by loop.run_forever() in the thread function.
-
-def start_ptb_dedicated_loop_thread():
-    """Creates a new event loop, runs ptb_initial_setup_and_run in it, and keeps the loop running."""
-    global PTB_EVENT_LOOP, PTB_INITIALIZED_EVENT, ptb_application
-    logger.info("Attempting to start PTB asyncio event loop in a dedicated thread.")
-    
-    new_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(new_loop)
-    PTB_EVENT_LOOP = new_loop
-    
-    try:
-        logger.info(f"PTB Thread: Running initial setup on loop {PTB_EVENT_LOOP}...")
-        PTB_EVENT_LOOP.run_until_complete(ptb_initial_setup_and_run())
-        
-        PTB_INITIALIZED_EVENT.set() # Signal that PTB_EVENT_LOOP is ready and PTB is initialized
-        logger.info(f"PTB Thread: Event Loop {PTB_EVENT_LOOP} is set up and running forever.")
-        
-        PTB_EVENT_LOOP.run_forever() # Keep the loop running
-        
-    except Exception as e:
-        logger.critical(f"Critical error in PTB dedicated thread: {e}", exc_info=True)
-        PTB_INITIALIZED_EVENT.set() # Also set event on error to unblock waiting threads, they will find loop not running
-    finally:
-        if PTB_EVENT_LOOP.is_running():
-            logger.info("PTB Thread: Stopping and closing event loop...")
-            PTB_EVENT_LOOP.call_soon_threadsafe(PTB_EVENT_LOOP.stop)
-            # loop.run_until_complete(ptb_application.shutdown()) # May need careful handling for shutdown
-        # PTB_EVENT_LOOP.close() # Close loop after it has stopped. run_forever might block this.
-        logger.info("PTB Thread: Exited.")
-
-# --- Flask Webhook Route ---
 @app.route(f'/webhook/{TOKEN}', methods=['POST'])
 def webhook_handler_route():
-    global PTB_EVENT_LOOP, ptb_application, PTB_INITIALIZED_EVENT
-
-    if not PTB_INITIALIZED_EVENT.is_set():
-        logger.info("Webhook: Waiting for PTB initialization...")
-        initialized = PTB_INITIALIZED_EVENT.wait(timeout=10.0) # Wait up to 10 seconds
-        if not initialized:
-            logger.error("Webhook: PTB initialization timed out. Update cannot be processed.")
-            return "Internal server error: Bot not ready (init timeout)", 503 # Service Unavailable
+    global PTB_EVENT_LOOP # Ensure you're using the global variable
 
     json_data = request.get_json()
     if not json_data:
         logger.warning("Received empty JSON in webhook")
         return "Empty request", 400
+    update = Update.de_json(json_data, application.bot)
 
-    if PTB_EVENT_LOOP and PTB_EVENT_LOOP.is_running():
+    if PTB_EVENT_LOOP:
+        # Submit process_update to be run on PTB's main event loop
+        future = asyncio.run_coroutine_threadsafe(application.process_update(update), PTB_EVENT_LOOP)
         try:
-            update = Update.de_json(json_data, ptb_application.bot)
-            # Ensure process_update is a coroutine; if it's already async, it's fine.
-            # If ptb_application.process_update itself is not an async function but schedules work,
-            # this remains correct.
-            asyncio.run_coroutine_threadsafe(ptb_application.process_update(update), PTB_EVENT_LOOP)
-        except Exception as e: # Catch errors during update processing submission
-            logger.error(f"Error submitting update to PTB event loop: {e}", exc_info=True)
-            return "Internal server error: Failed to process update", 500
+            # For webhooks, you usually want to return "OK" quickly.
+            # You can optionally wait for a very short timeout if you want to ensure
+            # the task was successfully submitted or catch immediate errors from submission.
+            # future.result(timeout=1) # Example: wait up to 1 second
+            pass
+        except Exception as e:
+            logger.error(f"Error when submitting/awaiting process_update via run_coroutine_threadsafe: {e}")
+            # Depending on the error, you might want to return a 500 status
+            # return "Error processing update", 500
     else:
-        logger.error("PTB application event loop is not available or not running after init. Update cannot be processed.")
-        return "Internal server error: Bot not ready (loop inactive)", 500
+        logger.error("PTB application event loop (PTB_EVENT_LOOP) is not available. Update cannot be processed.")
+        return "Internal server error: Bot loop not configured", 500
+
     return "OK", 200
 
-@app.route('/keep_alive', methods=['GET'])
-def keep_alive():
-    return "Bot's Flask component is running!", 200
+def run_flask():
+    logger.info(f"Starting Flask server on host 0.0.0.0 port {PORT}")
+    # Use a production-ready WSGI server like gunicorn or waitress in production
+    app.run(host='0.0.0.0', port=PORT, debug=False) # Set debug=False for production
 
-# --- Application Startup (Gunicorn Entry Point) ---
-# This block runs when main.py is imported by Gunicorn.
-# For Gunicorn, using the --preload flag is highly recommended.
-# This ensures this module-level code (and thus thread starting)
-# runs once in the master process before workers are forked.
 
-if __name__ != '__main__': # Standard check if run by a WSGI server like Gunicorn
-    if PTB_THREAD is None: # Basic check to start the thread only once
-        logger.info("Gunicorn mode: Initializing and starting PTB dedicated loop thread.")
-        PTB_INITIALIZED_EVENT = threading.Event() # Ensure it's created before thread start
-        PTB_THREAD = threading.Thread(target=start_ptb_dedicated_loop_thread, daemon=True)
-        PTB_THREAD.start()
-        # Note: The webhook handler will wait for PTB_INITIALIZED_EVENT.
+# --- Main Bot Logic ---
+async def main():
+    global PTB_EVENT_LOOP # Declare that we are going to assign to the global variable
+
+    init_db()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+
+    # Handler for user messages (private chat, not commands)
+    user_message_filters = (
+        filters.ChatType.PRIVATE & ~filters.COMMAND &
+        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO) # Corrected here
+    )
+    application.add_handler(MessageHandler(user_message_filters, handle_message))
+
+    # Handler for admin messages in the group topic (ensure ADMINS is populated)
+    if ADMIN_USER_IDS: # Only add admin handler if ADMINS are defined
+        admin_message_filters = (
+            filters.Chat(GROUP_ID) & filters.User(user_id=ADMIN_USER_IDS) & ~filters.COMMAND &
+            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO) & # Corrected here
+            filters.UpdateType.MESSAGE # Ensure it's a new message
+        )
+        application.add_handler(MessageHandler(admin_message_filters, forward_admin_message))
     else:
-        logger.info("Gunicorn mode: PTB dedicated loop thread reference already exists (possibly due to multiple imports or reloads).")
+        logger.warning("TELEGRAM_ADMINS not defined or empty. Admin reply forwarding will not work.")
 
-# If you were to run this file directly (e.g., for local testing without Gunicorn and test.py behavior):
-# if __name__ == '__main__':
-#     logger.info("Direct run mode: Initializing and starting PTB dedicated loop thread.")
-#     PTB_INITIALIZED_EVENT = threading.Event()
-#     PTB_THREAD = threading.Thread(target=start_ptb_dedicated_loop_thread, daemon=True)
-#     PTB_THREAD.start()
-#     PTB_INITIALIZED_EVENT.wait() # Wait for PTB to be ready before starting Flask
-#     if PTB_EVENT_LOOP and PTB_EVENT_LOOP.is_running():
-#         logger.info("Starting Flask development server.")
-#         app.run(host='0.0.0.0', port=PORT, debug=False) # Set debug=True for dev if needed
-#     else:
-#         logger.error("Failed to initialize PTB event loop. Flask server not started.")
+    application.add_error_handler(error_handler)
+
+    # Initialize the PTB application
+    await application.initialize()
+    logger.info("Telegram Application initialized.")
+
+    # Capture the event loop PTB is running on
+    PTB_EVENT_LOOP = asyncio.get_running_loop()
+    logger.info(f"PTB Event Loop captured: {PTB_EVENT_LOOP}")
+
+    # Set the webhook
+    await set_webhook()
+
+    # Start the Flask app in a separate daemon thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask thread started and running in background.")
+
+    try:
+        logger.info("Bot is running. Main asyncio loop active. Press Ctrl+C to stop.")
+        # This keeps the main asyncio loop (PTB_EVENT_LOOP) running
+        # so it can process tasks submitted by the Flask webhook handler.
+        while True:
+            await asyncio.sleep(3600) # Keep alive, adjust as needed
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutdown signal (KeyboardInterrupt/SystemExit) received in main loop.")
+    finally:
+        logger.info("Initiating PTB application shutdown...")
+        await application.shutdown()
+        logger.info("PTB application shutdown complete.")
+
+
+if __name__ == '__main__':    
+    if not TOKEN:
+        # logger might not be configured if this is the first line __main__ and it fails
+        print("CRITICAL: TELEGRAM_BOT_TOKEN environment variable not found! Exiting.") 
+        exit(1)
+    if os.getenv('TELEGRAM_GROUP_ID') is None:
+        print("CRITICAL: TELEGRAM_GROUP_ID environment variable not found! Exiting.")
+        exit(1)
+    if not WEBSITE_URL:
+        # logger might not be configured here either
+        print("WARNING: WEBSITE_URL environment variable not found! Webhook setup will fail if not already set.")
+
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        # Log critical errors during startup or main execution
+        if 'logger' in globals() and logger: # Check if logger is initialized
+            logger.critical(f"Critical error during bot execution: {e}", exc_info=True)
+        else:
+            print(f"CRITICAL error during bot execution (logger not available): {e}")
+    finally:
+        if 'logger' in globals() and logger:
+            logger.info("Exiting application.")
+        else:
+            print("Exiting application (logger not available).")
