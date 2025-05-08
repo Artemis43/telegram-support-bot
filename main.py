@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Telegram bot application
 application = Application.builder().token(TOKEN).build()
+PTB_EVENT_LOOP = None # Global variable to store the PTB event loop
 
 # --- Database Functions ---
 DB_NAME = 'bot_data.db'
@@ -298,30 +299,30 @@ def keep_alive():
 
 @app.route(f'/webhook/{TOKEN}', methods=['POST'])
 def webhook_handler_route():
+    global PTB_EVENT_LOOP # Ensure you're using the global variable
+
     json_data = request.get_json()
     if not json_data:
         logger.warning("Received empty JSON in webhook")
         return "Empty request", 400
-    # logger.debug(f"Webhook received: {json_data}")
     update = Update.de_json(json_data, application.bot)
 
-    if application.loop:
-        # Submit the process_update coroutine to the main PTB event loop
-        future = asyncio.run_coroutine_threadsafe(application.process_update(update), application.loop)
+    if PTB_EVENT_LOOP:
+        # Submit process_update to be run on PTB's main event loop
+        future = asyncio.run_coroutine_threadsafe(application.process_update(update), PTB_EVENT_LOOP)
         try:
-            # It's good practice to see if the task was accepted,
-            # but for webhooks, you usually return "OK" quickly.
-            # You could add a short timeout if you want to ensure it started processing.
-            # future.result(timeout=1) # Example: wait up to 1 second for the task to be scheduled/start
-            pass # Returning "OK" quickly is typical for webhooks
+            # For webhooks, you usually want to return "OK" quickly.
+            # You can optionally wait for a very short timeout if you want to ensure
+            # the task was successfully submitted or catch immediate errors from submission.
+            # future.result(timeout=1) # Example: wait up to 1 second
+            pass
         except Exception as e:
-            logger.error(f"Error when submitting process_update to event loop: {e}")
-            # Consider returning an error to Telegram if submission fails critically
+            logger.error(f"Error when submitting/awaiting process_update via run_coroutine_threadsafe: {e}")
+            # Depending on the error, you might want to return a 500 status
             # return "Error processing update", 500
     else:
-        logger.error("PTB application event loop not available for webhook processing. Update may not be handled.")
-        # This indicates a potential issue with application initialization or lifecycle.
-        return "Internal server error: Bot loop not ready", 500
+        logger.error("PTB application event loop (PTB_EVENT_LOOP) is not available. Update cannot be processed.")
+        return "Internal server error: Bot loop not configured", 500
 
     return "OK", 200
 
@@ -332,9 +333,9 @@ def run_flask():
 
 
 # --- Main Bot Logic ---
-# ... (other parts of your code) ...
-
 async def main():
+    global PTB_EVENT_LOOP # Declare that we are going to assign to the global variable
+
     init_db()
 
     # Add handlers
@@ -360,11 +361,15 @@ async def main():
 
     application.add_error_handler(error_handler)
 
-    # Initialize the PTB application (this also initializes application.bot and application.updater)
+    # Initialize the PTB application
     await application.initialize()
     logger.info("Telegram Application initialized.")
 
-    # Set the webhook using application.bot
+    # Capture the event loop PTB is running on
+    PTB_EVENT_LOOP = asyncio.get_running_loop()
+    logger.info(f"PTB Event Loop captured: {PTB_EVENT_LOOP}")
+
+    # Set the webhook
     await set_webhook()
 
     # Start the Flask app in a separate daemon thread
@@ -373,9 +378,11 @@ async def main():
     logger.info("Flask thread started and running in background.")
 
     try:
-        logger.info("Bot is running. Press Ctrl+C to stop.")
+        logger.info("Bot is running. Main asyncio loop active. Press Ctrl+C to stop.")
+        # This keeps the main asyncio loop (PTB_EVENT_LOOP) running
+        # so it can process tasks submitted by the Flask webhook handler.
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(3600) # Keep alive, adjust as needed
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown signal (KeyboardInterrupt/SystemExit) received in main loop.")
     finally:
@@ -384,12 +391,7 @@ async def main():
         logger.info("PTB application shutdown complete.")
 
 
-if __name__ == '__main__':
-    # ... (your existing startup checks) ...
-    # (Ensure logger is configured before being used in __main__ if critical errors occur early)
-    # logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-    # logger = logging.getLogger(__name__)
-    
+if __name__ == '__main__':    
     if not TOKEN:
         # logger might not be configured if this is the first line __main__ and it fails
         print("CRITICAL: TELEGRAM_BOT_TOKEN environment variable not found! Exiting.") 
@@ -403,14 +405,14 @@ if __name__ == '__main__':
 
     try:
         asyncio.run(main())
-    except Exception as e: 
-        # Use logger if available, otherwise print
-        if 'logger' in globals():
+    except Exception as e:
+        # Log critical errors during startup or main execution
+        if 'logger' in globals() and logger: # Check if logger is initialized
             logger.critical(f"Critical error during bot execution: {e}", exc_info=True)
         else:
-            print(f"CRITICAL error during bot execution: {e}")
+            print(f"CRITICAL error during bot execution (logger not available): {e}")
     finally:
-        if 'logger' in globals():
+        if 'logger' in globals() and logger:
             logger.info("Exiting application.")
         else:
-            print("Exiting application.")
+            print("Exiting application (logger not available).")
