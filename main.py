@@ -156,8 +156,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"Hello {username}👋,\nHow can I assist you today? "
-            "I've created a dedicated support topic for you in our admin group. "
-            "Just send your messages here."
         )
         # Send an initial message to the newly created topic from the bot
         await context.bot.send_message(
