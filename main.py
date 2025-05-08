@@ -333,57 +333,72 @@ async def main():
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-
-    # Handler for user messages (private chat, not commands)
-    user_message_filters = filters.ChatType.PRIVATE & ~filters.COMMAND & (
-        filters.TEXT | filters.PHOTO | filters.DOCUMENT | filters.VIDEO | filters.VOICE | filters.AUDIO
+    user_message_filters = (
+        filters.ChatType.PRIVATE & ~filters.COMMAND &
+        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.VOICE | filters.AUDIO)
     )
     application.add_handler(MessageHandler(user_message_filters, handle_message))
 
-    # Handler for admin messages in the group (must be in a topic and from an admin)
-    # Ensuring it's a topic message is key. Checking for ADMIN_USER_IDS is an extra layer.
-    admin_message_filters = filters.Chat(GROUP_ID) & filters.User(ADMIN_USER_IDS) & (
-        filters.TEXT | filters.PHOTO | filters.DOCUMENT | filters.VIDEO | filters.VOICE | filters.AUDIO
-    ) & filters.UpdateType.MESSAGE # Ensure it's a new message
-    # Further filtering for topic messages is done inside forward_admin_message
-
-    application.add_handler(MessageHandler(admin_message_filters, forward_admin_message))
+    if ADMIN_USER_IDS:
+        admin_message_filters = (
+            filters.Chat(GROUP_ID) & filters.User(user_id=ADMIN_USER_IDS) & ~filters.COMMAND &
+            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.VOICE | filters.AUDIO) &
+            filters.UpdateType.MESSAGE
+        )
+        application.add_handler(MessageHandler(admin_message_filters, forward_admin_message))
+    else:
+        logger.warning("TELEGRAM_ADMINS not defined or empty. Admin reply forwarding will not work.")
 
     application.add_error_handler(error_handler)
 
+    # Initialize the PTB application (this also initializes application.bot and application.updater)
     await application.initialize()
-    logger.info("Telegram application initialized.")
+    logger.info("Telegram Application initialized.")
 
-    # Set webhook (important to do this after initialization if set_webhook uses application.bot)
-    # Also, ensure WEBSITE_URL is correctly configured and publicly accessible via HTTPS
-    if WEBSITE_URL:
-        await set_webhook()
-    else:
-        logger.warning("WEBSITE_URL not set. Webhook will not be configured. Bot might need to run in polling mode (not configured here).")
+    # Set the webhook using application.bot
+    # This tells Telegram where to send updates but doesn't configure application.updater.webhook_url
+    await set_webhook()
 
+    # Start the Flask app in a separate daemon thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask thread started and running in background.")
 
-    logger.info("Bot setup complete. Running until disconnected.")
-    # This will keep the PTB application running for its internal tasks,
-    # even if not actively polling, which is good for webhooks too.
-    # It also handles graceful shutdown on signals like SIGINT, SIGTERM.
-    await application.run_until_disconnected()
+    # Keep the main asyncio event loop alive.
+    # The Flask thread is a daemon, so the main program would exit if main() finishes.
+    # We need to keep main() alive to serve the asyncio part (e.g. for run_coroutine_threadsafe)
+    # and to handle graceful shutdown of PTB.
+    try:
+        logger.info("Bot is running. Press Ctrl+C to stop.")
+        while True:
+            await asyncio.sleep(60)  # Keep the loop running, can be used for periodic tasks
+            # logger.debug("Main asyncio loop alive...") # Optional: for debugging
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutdown signal (KeyboardInterrupt/SystemExit) received in main loop.")
+    finally:
+        logger.info("Initiating PTB application shutdown...")
+        # Gracefully shut down PTB components (including the internal updater and bot)
+        # This is crucial for releasing resources.
+        await application.shutdown()
+        logger.info("PTB application shutdown complete.")
 
 
 if __name__ == '__main__':
     if not TOKEN:
-        logger.critical("TELEGRAM_BOT_TOKEN is not set. Exiting.")
-        exit(1)
-
-    # Start Flask in a separate thread
-    # Daemon=True means the Flask thread will exit when the main program exits
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+        logger.critical("TELEGRAM_BOT_TOKEN environment variable not found! Exiting.")
+        exit(1) # Exit with a non-zero code for error
+    if not GROUP_ID: # GROUP_ID is an int, so it could be 0 if not set and default used.
+                     # Better to check os.getenv('TELEGRAM_GROUP_ID') directly
+        if os.getenv('TELEGRAM_GROUP_ID') is None:
+            logger.critical("TELEGRAM_GROUP_ID environment variable not found! Exiting.")
+            exit(1)
+    if not WEBSITE_URL:
+        logger.warning("WEBSITE_URL environment variable not found! Webhook setup will fail if not already set.")
+        # exit(1) # You might want to make this critical depending on your deployment
 
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopping due to KeyboardInterrupt.")
-    except Exception as e:
-        logger.critical(f"Critical error in main asyncio run: {e}", exc_info=True)
+    except Exception as e: # Catch any unexpected error during asyncio.run(main())
+        logger.critical(f"Critical error during bot execution: {e}", exc_info=True)
     finally:
-        logger.info("Bot has shut down.")
+        logger.info("Exiting application.")
