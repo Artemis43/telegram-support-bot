@@ -2,19 +2,18 @@ import os
 import logging
 import sqlite3
 import asyncio
-import requests
-import threading # Ensure threading is imported
+import requests # Keep requests if you need it for other things, not strictly for PTB webhook setting in this version
+import threading
 from flask import Flask, request
-from telegram import Update, Bot, ForumTopic # Removed Bot, ForumTopic if not used directly here
+from telegram import Update # Bot, ForumTopic might not be needed directly at the top level
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import NetworkError, BadRequest
-
 
 # Load environment variables
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GROUP_ID = int(os.getenv('TELEGRAM_GROUP_ID'))
 ADMIN_USER_IDS = [int(admin_id.strip()) for admin_id in os.getenv('TELEGRAM_ADMINS', '').split(',') if admin_id.strip()]
-PORT = int(os.getenv('PORT', "8443")) # Gunicorn will use this if specified in Procfile/command
+PORT = int(os.getenv('PORT', "8443"))
 WEBSITE_URL = os.getenv('WEBSITE_URL')
 
 # Critical environment variable checks
@@ -39,18 +38,15 @@ logger = logging.getLogger(__name__)
 
 # --- Global variables for PTB ---
 ptb_application = Application.builder().token(TOKEN).build()
-PTB_EVENT_LOOP = None
-PTB_THREAD = None # To hold the reference to the PTB thread
+PTB_EVENT_LOOP = None  # This will store the single event loop for PTB
+PTB_THREAD = None
+PTB_INITIALIZED_EVENT = threading.Event() # To signal when PTB_EVENT_LOOP is ready
 
 # --- Database Functions ---
 DB_NAME = 'bot_data.db'
 
 def init_db():
-    # Ensure this function is safe to call multiple times or is called only once.
-    # If Gunicorn workers all import main.py, this might be called by each.
-    # For SQLite, file creation is usually fine.
-    # More complex DB setups might need a dedicated migration/setup step.
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False) # check_same_thread=False for SQLite with threads
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users
                      (chat_id INTEGER PRIMARY KEY, username TEXT, thread_id INTEGER UNIQUE)''')
@@ -58,10 +54,9 @@ def init_db():
     conn.close()
     logger.info("Database initialized (or already exists).")
 
-# ... (Your existing save_user_to_db, get_user_chat_id, get_user_thread functions) ...
 def save_user_to_db(chat_id: int, username: str, thread_id: int):
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('INSERT OR REPLACE INTO users (chat_id, username, thread_id) VALUES (?, ?, ?)',
                        (chat_id, username, thread_id))
@@ -75,7 +70,7 @@ def save_user_to_db(chat_id: int, username: str, thread_id: int):
 
 def get_user_chat_id(thread_id: int) -> int | None:
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('SELECT chat_id FROM users WHERE thread_id=?', (thread_id,))
         result = cursor.fetchone()
@@ -89,7 +84,7 @@ def get_user_chat_id(thread_id: int) -> int | None:
 
 def get_user_thread(chat_id: int) -> int | None:
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('SELECT thread_id FROM users WHERE chat_id=?', (chat_id,))
         result = cursor.fetchone()
@@ -102,19 +97,17 @@ def get_user_thread(chat_id: int) -> int | None:
             conn.close()
 
 # --- Webhook Setup ---
-async def set_webhook():
-    global ptb_application # Use the global ptb_application instance
+async def set_webhook_async(): # Renamed to avoid conflict if there was a non-async one
+    global ptb_application
     webhook_url = f"{WEBSITE_URL}/webhook/{TOKEN}"
     try:
-        # Use ptb_application.bot for sending the request
         bot = ptb_application.bot
         await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
         logger.info(f"Webhook set successfully: {webhook_url}")
     except NetworkError as e:
         logger.error(f"Network error while setting webhook: {e}")
-    except Exception as e: # Catch more specific exceptions if possible
-        logger.error(f"An unexpected error occurred during set_webhook: {e}")
-
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during set_webhook_async: {e}")
 
 # --- Command Handlers & Message Handlers (use global ptb_application) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -128,13 +121,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Hello {username}👋,\nHow can I assist you today?"
             )
-            await context.bot.send_message(
-                chat_id=GROUP_ID,
-                text=f"User {username} (Chat ID: {chat_id}) interacted with /start again.",
-                message_thread_id=existing_thread_id
-            )
+            # Removed redundant message to group topic for existing user on /start
         except BadRequest as e:
-            logger.error(f"Error informing user/topic about existing session for {chat_id}: {e}")
+            logger.error(f"Error informing user about existing session for {chat_id}: {e}")
         return
 
     topic_name = f"Support: {username} ({user.id})"
@@ -161,12 +150,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Unexpected error in start for {username} ({chat_id}): {e}", exc_info=True)
         await update.message.reply_text("Unexpected error starting session. Try again.")
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
     chat_id = update.message.chat_id
     user = update.message.from_user
-    username = user.username or user.first_name
+    # username = user.username or user.first_name # Not strictly needed here
     thread_id = get_user_thread(chat_id)
 
     if not thread_id:
@@ -189,7 +177,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_audio(chat_id=GROUP_ID, audio=update.message.audio.file_id, caption=update.message.caption, message_thread_id=thread_id)
         # Add other media types as needed (sticker, video_note, etc.)
         else:
-            await update.message.reply_text("Can only forward text messages currently.")
+            await update.message.reply_text("This message type cannot be forwarded at the moment.") # Fallback
     except BadRequest as e:
         logger.error(f"BadRequest sending user message from {chat_id} to thread {thread_id}: {e}")
         await update.message.reply_text("Issue sending message. Try again.")
@@ -205,7 +193,6 @@ async def forward_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
     user_chat_id = get_user_chat_id(thread_id)
 
     if not user_chat_id:
-        # logger.warning(f"No user for thread ID: {thread_id}. Admin: {message.from_user.username or message.from_user.first_name}")
         return
 
     try:
@@ -223,10 +210,8 @@ async def forward_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_audio(chat_id=user_chat_id, audio=message.audio.file_id, caption=message.caption)
         # Add other media types as needed
         else:
-            logger.info(f"Admin sent unhandled message type to user for thread {thread_id}")
+            # logger.info(f"Admin sent unhandled message type to user for thread {thread_id}")
             await message.reply_text("This message type cannot be forwarded to the user at this time.")
-
-
     except BadRequest as e:
         logger.error(f"BadRequest sending admin message from thread {thread_id} to user {user_chat_id}: {e}")
         await message.reply_text(f"Failed to send to user. Error: {e.message}")
@@ -236,64 +221,31 @@ async def forward_admin_message(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # For specific errors, you might want to inform the user if the update object is available
     if isinstance(update, Update) and update.effective_message:
         try:
-            # Avoid sending error messages for some known issues, e.g. if a user blocks the bot
             if isinstance(context.error, BadRequest) and "bot was blocked by the user" in str(context.error).lower():
-                logger.warning(f"Bot was blocked by user {update.effective_chat.id if update.effective_chat else 'N/A'}. Cannot send message.")
-                return # Don't try to send a message back
-
-            # await update.effective_message.reply_text(
-            #     "Sorry, an unexpected error occurred. The developers have been notified."
-            # )
+                logger.warning(f"Bot was blocked by user {update.effective_chat.id if update.effective_chat else 'N/A'}.")
+                return
+            # Consider removing automatic error reply to user or making it very generic
+            # await update.effective_message.reply_text("An error occurred.")
         except Exception as e:
             logger.error(f"Exception in error_handler while trying to inform user: {e}")
 
-# --- Flask Webhook Route ---
-@app.route(f'/webhook/{TOKEN}', methods=['POST'])
-def webhook_handler_route():
-    global PTB_EVENT_LOOP, ptb_application # Access global variables
-    json_data = request.get_json()
-    if not json_data:
-        logger.warning("Received empty JSON in webhook")
-        return "Empty request", 400
+# --- PTB Async Setup and Run Logic (to be run in the dedicated thread) ---
+async def ptb_initial_setup_and_run():
+    global ptb_application
 
-    update = Update.de_json(json_data, ptb_application.bot) # Use ptb_application.bot
+    logger.info("PTB Async Setup: Initializing database...")
+    init_db() # Ensure this is thread-safe for SQLite if called from multiple Gunicorn workers without --preload
 
-    if PTB_EVENT_LOOP and PTB_EVENT_LOOP.is_running():
-        future = asyncio.run_coroutine_threadsafe(ptb_application.process_update(update), PTB_EVENT_LOOP)
-        try:
-            # Optionally, you can add a timeout to future.result() if you want to wait
-            # for a brief moment, but for webhooks, it's best to return "OK" quickly.
-            # future.result(timeout=1) # e.g., wait 1 second
-            pass
-        except Exception as e:
-            logger.error(f"Error when submitting/awaiting process_update via run_coroutine_threadsafe: {e}")
-            # Consider returning 500 if the submission itself fails critically
-    else:
-        logger.error("PTB application event loop is not available or not running. Update cannot be processed.")
-        return "Internal server error: Bot not ready", 500
-    return "OK", 200
-
-@app.route('/keep_alive', methods=['GET']) # For Render's health checks or other services
-def keep_alive():
-    return "Bot's Flask component is running!", 200
-
-# --- PTB Main Async Logic (to be run in a separate thread) ---
-async def ptb_main_runner():
-    global PTB_EVENT_LOOP, ptb_application # Use global instances
-
-    logger.info("PTB main_runner: Initializing database...")
-    init_db() # Initialize DB once when PTB starts
-
-    logger.info("PTB main_runner: Adding handlers...")
+    logger.info("PTB Async Setup: Adding handlers...")
     ptb_application.add_handler(CommandHandler("start", start))
     user_message_filters = (
         filters.ChatType.PRIVATE & ~filters.COMMAND &
         (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO)
     )
     ptb_application.add_handler(MessageHandler(user_message_filters, handle_message))
+
     if ADMIN_USER_IDS:
         admin_message_filters = (
             filters.Chat(GROUP_ID) & filters.User(user_id=ADMIN_USER_IDS) & ~filters.COMMAND &
@@ -303,48 +255,106 @@ async def ptb_main_runner():
         ptb_application.add_handler(MessageHandler(admin_message_filters, forward_admin_message))
     ptb_application.add_error_handler(error_handler)
 
-    logger.info("PTB main_runner: Initializing PTB application...")
+    logger.info("PTB Async Setup: Initializing PTB application...")
     await ptb_application.initialize() # Initializes bot, updater, etc.
-    logger.info("PTB main_runner: Telegram Application initialized.")
+    logger.info("PTB Async Setup: Telegram Application initialized.")
 
-    PTB_EVENT_LOOP = asyncio.get_running_loop()
-    logger.info(f"PTB main_runner: Event Loop captured: {PTB_EVENT_LOOP}")
+    logger.info("PTB Async Setup: Setting webhook...")
+    await set_webhook_async()
 
-    # Set the webhook once PTB application is initialized and loop is running
-    logger.info("PTB main_runner: Setting webhook...")
-    await set_webhook() # Ensure this uses ptb_application.bot
+    logger.info("PTB Async Setup: Complete. PTB ready for updates via webhook.")
+    # The event loop will be kept running by loop.run_forever() in the thread function.
 
-    logger.info("PTB main_runner: Asyncio event loop running. PTB ready for updates.")
+def start_ptb_dedicated_loop_thread():
+    """Creates a new event loop, runs ptb_initial_setup_and_run in it, and keeps the loop running."""
+    global PTB_EVENT_LOOP, PTB_INITIALIZED_EVENT, ptb_application
+    logger.info("Attempting to start PTB asyncio event loop in a dedicated thread.")
+    
+    new_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(new_loop)
+    PTB_EVENT_LOOP = new_loop
+    
     try:
-        # Keep the asyncio event loop running indefinitely
-        while True:
-            await asyncio.sleep(3600) # Or some other mechanism to keep alive
-    except asyncio.CancelledError:
-        logger.info("PTB main_runner: Asyncio loop cancelled.")
-    finally:
-        logger.info("PTB main_runner: Shutting down PTB application...")
-        await ptb_application.shutdown()
-        logger.info("PTB main_runner: PTB application shutdown complete.")
-
-def start_ptb_thread():
-    """Starts the PTB's asyncio event loop in a new thread."""
-    logger.info("Attempting to start PTB asyncio event loop in a new thread.")
-    try:
-        asyncio.run(ptb_main_runner())
+        logger.info(f"PTB Thread: Running initial setup on loop {PTB_EVENT_LOOP}...")
+        PTB_EVENT_LOOP.run_until_complete(ptb_initial_setup_and_run())
+        
+        PTB_INITIALIZED_EVENT.set() # Signal that PTB_EVENT_LOOP is ready and PTB is initialized
+        logger.info(f"PTB Thread: Event Loop {PTB_EVENT_LOOP} is set up and running forever.")
+        
+        PTB_EVENT_LOOP.run_forever() # Keep the loop running
+        
     except Exception as e:
-        logger.critical(f"Critical error in PTB thread (start_ptb_thread): {e}", exc_info=True)
+        logger.critical(f"Critical error in PTB dedicated thread: {e}", exc_info=True)
+        PTB_INITIALIZED_EVENT.set() # Also set event on error to unblock waiting threads, they will find loop not running
+    finally:
+        if PTB_EVENT_LOOP.is_running():
+            logger.info("PTB Thread: Stopping and closing event loop...")
+            PTB_EVENT_LOOP.call_soon_threadsafe(PTB_EVENT_LOOP.stop)
+            # loop.run_until_complete(ptb_application.shutdown()) # May need careful handling for shutdown
+        # PTB_EVENT_LOOP.close() # Close loop after it has stopped. run_forever might block this.
+        logger.info("PTB Thread: Exited.")
 
-# --- Application Startup ---
+# --- Flask Webhook Route ---
+@app.route(f'/webhook/{TOKEN}', methods=['POST'])
+def webhook_handler_route():
+    global PTB_EVENT_LOOP, ptb_application, PTB_INITIALIZED_EVENT
+
+    if not PTB_INITIALIZED_EVENT.is_set():
+        logger.info("Webhook: Waiting for PTB initialization...")
+        initialized = PTB_INITIALIZED_EVENT.wait(timeout=10.0) # Wait up to 10 seconds
+        if not initialized:
+            logger.error("Webhook: PTB initialization timed out. Update cannot be processed.")
+            return "Internal server error: Bot not ready (init timeout)", 503 # Service Unavailable
+
+    json_data = request.get_json()
+    if not json_data:
+        logger.warning("Received empty JSON in webhook")
+        return "Empty request", 400
+
+    if PTB_EVENT_LOOP and PTB_EVENT_LOOP.is_running():
+        try:
+            update = Update.de_json(json_data, ptb_application.bot)
+            # Ensure process_update is a coroutine; if it's already async, it's fine.
+            # If ptb_application.process_update itself is not an async function but schedules work,
+            # this remains correct.
+            asyncio.run_coroutine_threadsafe(ptb_application.process_update(update), PTB_EVENT_LOOP)
+        except Exception as e: # Catch errors during update processing submission
+            logger.error(f"Error submitting update to PTB event loop: {e}", exc_info=True)
+            return "Internal server error: Failed to process update", 500
+    else:
+        logger.error("PTB application event loop is not available or not running after init. Update cannot be processed.")
+        return "Internal server error: Bot not ready (loop inactive)", 500
+    return "OK", 200
+
+@app.route('/keep_alive', methods=['GET'])
+def keep_alive():
+    return "Bot's Flask component is running!", 200
+
+# --- Application Startup (Gunicorn Entry Point) ---
 # This block runs when main.py is imported by Gunicorn.
-# It ensures the PTB part is initialized and running in its own thread.
-if PTB_THREAD is None or not PTB_THREAD.is_alive():
-    logger.info("main.py loaded: Initializing and starting PTB thread.")
-    PTB_THREAD = threading.Thread(target=start_ptb_thread, daemon=True)
-    PTB_THREAD.start()
-else:
-    logger.info("main.py loaded: PTB thread already appears to be running.")
+# For Gunicorn, using the --preload flag is highly recommended.
+# This ensures this module-level code (and thus thread starting)
+# runs once in the master process before workers are forked.
 
-# Note: The Flask app 'app' is now ready to be served by Gunicorn.
-# The if __name__ == '__main__': block that previously ran app.run() and asyncio.run(main_async_logic)
-# is removed because Gunicorn will manage the Flask app's lifecycle,
-# and we've started the PTB logic in a daemon thread above.
+if __name__ != '__main__': # Standard check if run by a WSGI server like Gunicorn
+    if PTB_THREAD is None: # Basic check to start the thread only once
+        logger.info("Gunicorn mode: Initializing and starting PTB dedicated loop thread.")
+        PTB_INITIALIZED_EVENT = threading.Event() # Ensure it's created before thread start
+        PTB_THREAD = threading.Thread(target=start_ptb_dedicated_loop_thread, daemon=True)
+        PTB_THREAD.start()
+        # Note: The webhook handler will wait for PTB_INITIALIZED_EVENT.
+    else:
+        logger.info("Gunicorn mode: PTB dedicated loop thread reference already exists (possibly due to multiple imports or reloads).")
+
+# If you were to run this file directly (e.g., for local testing without Gunicorn and test.py behavior):
+# if __name__ == '__main__':
+#     logger.info("Direct run mode: Initializing and starting PTB dedicated loop thread.")
+#     PTB_INITIALIZED_EVENT = threading.Event()
+#     PTB_THREAD = threading.Thread(target=start_ptb_dedicated_loop_thread, daemon=True)
+#     PTB_THREAD.start()
+#     PTB_INITIALIZED_EVENT.wait() # Wait for PTB to be ready before starting Flask
+#     if PTB_EVENT_LOOP and PTB_EVENT_LOOP.is_running():
+#         logger.info("Starting Flask development server.")
+#         app.run(host='0.0.0.0', port=PORT, debug=False) # Set debug=True for dev if needed
+#     else:
+#         logger.error("Failed to initialize PTB event loop. Flask server not started.")
