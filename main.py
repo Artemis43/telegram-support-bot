@@ -328,22 +328,27 @@ def run_flask():
 
 
 # --- Main Bot Logic ---
+# ... (other parts of your code) ...
+
 async def main():
     init_db()
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
+
+    # Handler for user messages (private chat, not commands)
     user_message_filters = (
         filters.ChatType.PRIVATE & ~filters.COMMAND &
-        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.VOICE | filters.AUDIO)
+        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO) # Corrected here
     )
     application.add_handler(MessageHandler(user_message_filters, handle_message))
 
-    if ADMIN_USER_IDS:
+    # Handler for admin messages in the group topic (ensure ADMINS is populated)
+    if ADMIN_USER_IDS: # Only add admin handler if ADMINS are defined
         admin_message_filters = (
             filters.Chat(GROUP_ID) & filters.User(user_id=ADMIN_USER_IDS) & ~filters.COMMAND &
-            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.VOICE | filters.AUDIO) &
-            filters.UpdateType.MESSAGE
+            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO) & # Corrected here
+            filters.UpdateType.MESSAGE # Ensure it's a new message
         )
         application.add_handler(MessageHandler(admin_message_filters, forward_admin_message))
     else:
@@ -356,7 +361,6 @@ async def main():
     logger.info("Telegram Application initialized.")
 
     # Set the webhook using application.bot
-    # This tells Telegram where to send updates but doesn't configure application.updater.webhook_url
     await set_webhook()
 
     # Start the Flask app in a separate daemon thread
@@ -364,41 +368,45 @@ async def main():
     flask_thread.start()
     logger.info("Flask thread started and running in background.")
 
-    # Keep the main asyncio event loop alive.
-    # The Flask thread is a daemon, so the main program would exit if main() finishes.
-    # We need to keep main() alive to serve the asyncio part (e.g. for run_coroutine_threadsafe)
-    # and to handle graceful shutdown of PTB.
     try:
         logger.info("Bot is running. Press Ctrl+C to stop.")
         while True:
-            await asyncio.sleep(60)  # Keep the loop running, can be used for periodic tasks
-            # logger.debug("Main asyncio loop alive...") # Optional: for debugging
+            await asyncio.sleep(60)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown signal (KeyboardInterrupt/SystemExit) received in main loop.")
     finally:
         logger.info("Initiating PTB application shutdown...")
-        # Gracefully shut down PTB components (including the internal updater and bot)
-        # This is crucial for releasing resources.
         await application.shutdown()
         logger.info("PTB application shutdown complete.")
 
 
 if __name__ == '__main__':
+    # ... (your existing startup checks) ...
+    # (Ensure logger is configured before being used in __main__ if critical errors occur early)
+    # logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+    # logger = logging.getLogger(__name__)
+    
     if not TOKEN:
-        logger.critical("TELEGRAM_BOT_TOKEN environment variable not found! Exiting.")
-        exit(1) # Exit with a non-zero code for error
-    if not GROUP_ID: # GROUP_ID is an int, so it could be 0 if not set and default used.
-                     # Better to check os.getenv('TELEGRAM_GROUP_ID') directly
-        if os.getenv('TELEGRAM_GROUP_ID') is None:
-            logger.critical("TELEGRAM_GROUP_ID environment variable not found! Exiting.")
-            exit(1)
+        # logger might not be configured if this is the first line __main__ and it fails
+        print("CRITICAL: TELEGRAM_BOT_TOKEN environment variable not found! Exiting.") 
+        exit(1)
+    if os.getenv('TELEGRAM_GROUP_ID') is None:
+        print("CRITICAL: TELEGRAM_GROUP_ID environment variable not found! Exiting.")
+        exit(1)
     if not WEBSITE_URL:
-        logger.warning("WEBSITE_URL environment variable not found! Webhook setup will fail if not already set.")
-        # exit(1) # You might want to make this critical depending on your deployment
+        # logger might not be configured here either
+        print("WARNING: WEBSITE_URL environment variable not found! Webhook setup will fail if not already set.")
 
     try:
         asyncio.run(main())
-    except Exception as e: # Catch any unexpected error during asyncio.run(main())
-        logger.critical(f"Critical error during bot execution: {e}", exc_info=True)
+    except Exception as e: 
+        # Use logger if available, otherwise print
+        if 'logger' in globals():
+            logger.critical(f"Critical error during bot execution: {e}", exc_info=True)
+        else:
+            print(f"CRITICAL error during bot execution: {e}")
     finally:
-        logger.info("Exiting application.")
+        if 'logger' in globals():
+            logger.info("Exiting application.")
+        else:
+            print("Exiting application.")
