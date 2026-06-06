@@ -1,416 +1,965 @@
+"""
+Telegram Support Bot — main.py
+===============================
+A two-way support relay between users (private DM) and a Telegram Forum Group.
+Each user gets a dedicated forum topic. Admins reply from the group.
+
+Deployment: Gunicorn (WSGI). PTB runs on a dedicated asyncio thread.
+Entry point for Gunicorn: `gunicorn main:app`
+
+Environment variables (see .env.example):
+  TELEGRAM_BOT_TOKEN  — Bot API token from @BotFather
+  TELEGRAM_GROUP_ID   — Forum-enabled group chat ID
+  TELEGRAM_ADMINS     — Comma-separated admin user IDs
+  PORT                — Flask port (default: 8443)
+  WEBSITE_URL         — Public HTTPS URL for webhook
+  DB_PATH             — Path to SQLite DB file (default: bot_data.db)
+  RATE_LIMIT_MAX      — Max messages per window per user (default: 5)
+  RATE_LIMIT_WINDOW   — Rate limit window in seconds (default: 10)
+"""
+
 import os
 import logging
 import sqlite3
 import asyncio
-import requests
 import threading
-from flask import Flask, request
-from telegram import Update, Bot, ForumTopic
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import NetworkError, BadRequest
+import time
+from collections import defaultdict
+from datetime import datetime
 
-# Load environment variables
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GROUP_ID = int(os.getenv('TELEGRAM_GROUP_ID')) # Ensure GROUP_ID is an integer
-ADMIN_USER_IDS = [int(admin_id.strip()) for admin_id in os.getenv('TELEGRAM_ADMINS', '').split(',') if admin_id.strip()] # Ensure ADMINS are integers
-PORT = int(os.getenv('PORT', "8443")) # Default to 8443 if not set
-WEBSITE_URL = os.getenv('WEBSITE_URL') # e.g., https://your-app-name.on-render.com
+from dotenv import load_dotenv
+from flask import Flask, request as flask_request
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, CallbackQueryHandler
+)
+from telegram.error import NetworkError, BadRequest, Forbidden
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 0. Load environment
+# ──────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+TOKEN          = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GROUP_ID       = int(os.getenv("TELEGRAM_GROUP_ID", "0"))
+ADMIN_USER_IDS = [
+    int(x.strip())
+    for x in os.getenv("TELEGRAM_ADMINS", "").split(",")
+    if x.strip()
+]
+PORT           = int(os.getenv("PORT", "8443"))
+WEBSITE_URL    = os.getenv("WEBSITE_URL", "")
+DB_PATH        = os.getenv("DB_PATH", "bot_data.db")
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "10"))  # seconds
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. Validation
+# ──────────────────────────────────────────────────────────────────────────────
 if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
+    raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
 if not GROUP_ID:
-    raise ValueError("TELEGRAM_GROUP_ID environment variable not set.")
+    raise ValueError("TELEGRAM_GROUP_ID is not set.")
 if not WEBSITE_URL:
-    raise ValueError("WEBSITE_URL environment variable not set.")
-if not ADMIN_USER_IDS:
-    logging.warning("TELEGRAM_ADMINS environment variable not set or empty. Admin-specific functions might not work as expected.")
+    raise ValueError("WEBSITE_URL is not set.")
 
-
-# Initialize Flask app
-app = Flask(__name__)
-
-# Logging configuration
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. Logging
+# ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Telegram bot application
-application = Application.builder().token(TOKEN).build()
-PTB_EVENT_LOOP = None # Global variable to store the PTB event loop
+if not ADMIN_USER_IDS:
+    logger.warning("TELEGRAM_ADMINS is empty — admin commands will not work.")
 
-# --- Database Functions ---
-DB_NAME = 'bot_data.db'
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. Flask app & PTB globals
+# ──────────────────────────────────────────────────────────────────────────────
+flask_app = Flask(__name__)
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users
-                     (chat_id INTEGER PRIMARY KEY, username TEXT, thread_id INTEGER UNIQUE)''') # thread_id should be unique
+ptb_application: Application = Application.builder().token(TOKEN).build()
+PTB_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
+PTB_THREAD: threading.Thread | None = None
+PTB_INITIALIZED_EVENT = threading.Event()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. Rate limiter (in-memory, per user)
+# ──────────────────────────────────────────────────────────────────────────────
+_rate_data: dict[int, list[float]] = defaultdict(list)
+_rate_lock = threading.Lock()
+
+
+def is_rate_limited(chat_id: int) -> bool:
+    """Return True if the user has exceeded RATE_LIMIT_MAX in RATE_LIMIT_WINDOW."""
+    now = time.monotonic()
+    with _rate_lock:
+        timestamps = _rate_data[chat_id]
+        # Remove old entries outside the window
+        _rate_data[chat_id] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+        if len(_rate_data[chat_id]) >= RATE_LIMIT_MAX:
+            return True
+        _rate_data[chat_id].append(now)
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. Database
+# ──────────────────────────────────────────────────────────────────────────────
+def _connect() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db() -> None:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id         INTEGER PRIMARY KEY,
+            username        TEXT,
+            thread_id       INTEGER UNIQUE,
+            is_banned       INTEGER NOT NULL DEFAULT 0,
+            is_closed       INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            last_message_at TEXT
+        );
+    """)
     conn.commit()
     conn.close()
-    logger.info("Database initialized.")
+    logger.info("Database initialised at '%s'.", DB_PATH)
 
-def save_user_to_db(chat_id: int, username: str, thread_id: int):
+
+# ── Getters / setters ─────────────────────────────────────────────────────────
+
+def save_user(chat_id: int, username: str, thread_id: int) -> None:
     try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        # Use INSERT OR REPLACE to handle cases where user might /start again (though we try to prevent new topic creation)
-        cursor.execute('INSERT OR REPLACE INTO users (chat_id, username, thread_id) VALUES (?, ?, ?)',
-                       (chat_id, username, thread_id))
+        conn = _connect()
+        conn.execute(
+            "INSERT OR REPLACE INTO users (chat_id, username, thread_id) VALUES (?, ?, ?)",
+            (chat_id, username, thread_id),
+        )
         conn.commit()
-        logger.info(f"Saved/Updated user {username} ({chat_id}) with thread_id {thread_id}")
+        conn.close()
     except sqlite3.Error as e:
-        logger.error(f"Database error in save_user_to_db: {e}")
-    finally:
-        if conn:
-            conn.close()
+        logger.error("save_user: %s", e)
 
-def get_user_chat_id(thread_id: int) -> int | None:
+
+def get_thread(chat_id: int) -> int | None:
     try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute('SELECT chat_id FROM users WHERE thread_id=?', (thread_id,))
-        result = cursor.fetchone()
-        return result[0] if result else None
+        conn = _connect()
+        row = conn.execute(
+            "SELECT thread_id FROM users WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
     except sqlite3.Error as e:
-        logger.error(f"Database error in get_user_chat_id: {e}")
+        logger.error("get_thread: %s", e)
         return None
-    finally:
-        if conn:
-            conn.close()
 
-def get_user_thread(chat_id: int) -> int | None:
+
+def get_chat_id(thread_id: int) -> int | None:
     try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute('SELECT thread_id FROM users WHERE chat_id=?', (chat_id,))
-        result = cursor.fetchone()
-        return result[0] if result else None
+        conn = _connect()
+        row = conn.execute(
+            "SELECT chat_id FROM users WHERE thread_id=?", (thread_id,)
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
     except sqlite3.Error as e:
-        logger.error(f"Database error in get_user_thread: {e}")
+        logger.error("get_chat_id: %s", e)
         return None
-    finally:
-        if conn:
-            conn.close()
 
-# --- Webhook Setup ---
-async def set_webhook():
-    webhook_url = f"{WEBSITE_URL}/webhook/{TOKEN}"
+
+def get_user_row(chat_id: int) -> dict | None:
     try:
-        response = requests.get(f'https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}&drop_pending_updates=True')
-        response.raise_for_status() # Raise an exception for HTTP errors
-        if response.json().get("ok"):
-            logger.info(f"Webhook set successfully: {webhook_url}")
-        else:
-            logger.error(f"Failed to set webhook: {response.text}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error while setting webhook: {e}")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during set_webhook: {e}")
+        conn = _connect()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM users WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except sqlite3.Error as e:
+        logger.error("get_user_row: %s", e)
+        return None
 
 
-# --- Command Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    chat_id = update.message.chat_id
-    username = user.username or user.first_name # Use first_name if username is not set
-
-    # Check if user already has an active topic
-    existing_thread_id = get_user_thread(chat_id)
-    if existing_thread_id:
-        try:
-            await update.message.reply_text(
-                f"Hello {username}👋,\nI'm already assisting you. Please continue sending your messages here, "
-                f"and they will appear in your dedicated support topic in our group."
-            )
-            # Optionally, notify the existing topic
-            await context.bot.send_message(
-                chat_id=GROUP_ID,
-                text=f"User {username} (Chat ID: {chat_id}) interacted with /start again.",
-                message_thread_id=existing_thread_id
-            )
-        except BadRequest as e:
-            logger.error(f"Error informing user/topic about existing session for {chat_id}: {e}")
-        return
-
-    # Create a unique topic name
-    topic_name = f"Support: {username} ({user.id})" # Using user.id ensures uniqueness even if username changes
-
+def set_banned(chat_id: int, banned: bool) -> None:
     try:
-        # Create a new forum topic/thread for the user in the group
-        logger.info(f"Attempting to create forum topic '{topic_name}' in group {GROUP_ID}")
-        forum_topic: ForumTopic = await context.bot.create_forum_topic(chat_id=GROUP_ID, name=topic_name)
-        thread_id = forum_topic.message_thread_id
-
-        logger.info(f"ForumTopic object created: {forum_topic}")
-        logger.info(f"Thread ID for user {username} ({chat_id}): {thread_id}")
-
-        if not thread_id:
-            logger.error(f"Failed to create or retrieve valid thread_id for topic: {topic_name}. ForumTopic response: {forum_topic}")
-            await update.message.reply_text("Sorry, I couldn't set up a support channel for you at the moment. Please try again later.")
-            return
-
-        save_user_to_db(chat_id, username, thread_id)
-
-        await update.message.reply_text(
-            f"Hello {username}👋,\nHow can I assist you today? "
+        conn = _connect()
+        conn.execute(
+            "UPDATE users SET is_banned=? WHERE chat_id=?",
+            (1 if banned else 0, chat_id),
         )
-        # Send an initial message to the newly created topic from the bot
-        await context.bot.send_message(
-            chat_id=GROUP_ID,
-            text=f"New support session started for user: {username} (Chat ID: {chat_id}, User ID: {user.id}).\n"
-                 f"Please use this topic to communicate with them.",
-            message_thread_id=thread_id
-        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        logger.error("set_banned: %s", e)
 
-    except BadRequest as e:
-        logger.error(f"BadRequest while creating forum topic for {username} ({chat_id}): {e}. "
-                     f"Ensure the bot is admin in a 'forum' group (topics enabled) and has 'manage_topics' permission.")
-        await update.message.reply_text("I encountered an issue setting up your support channel. Please ensure the bot is configured correctly in the support group. You might need to contact an administrator directly.")
-    except Exception as e: # Catch any other unexpected errors
-        logger.error(f"An unexpected error occurred in start for {username} ({chat_id}): {e}", exc_info=True)
-        await update.message.reply_text("An unexpected error occurred while starting our session. Please try again in a few moments.")
 
-# --- Message Handlers ---
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This handler is for messages from users in private chat
-    if not update.message: # Can happen with channel_post_updates etc.
-        return
-
-    chat_id = update.message.chat_id
-    user = update.message.from_user
-    username = user.username or user.first_name
-
-    thread_id = get_user_thread(chat_id)
-
-    if not thread_id:
-        logger.warning(f"No thread ID found for user {username} ({chat_id}). They might need to /start first.")
-        await update.message.reply_text("I don't have an active support session for you. Please use the /start command to begin.")
-        return
-
+def set_closed(chat_id: int, closed: bool) -> None:
     try:
-        # Forward the user's message to the corresponding thread in the support group
-        if update.message.text:
-            await context.bot.send_message(chat_id=GROUP_ID, text=update.message.text, message_thread_id=thread_id)
-        elif update.message.photo:
-            await context.bot.send_photo(chat_id=GROUP_ID, photo=update.message.photo[-1].file_id, caption=update.message.caption, message_thread_id=thread_id)
-        elif update.message.document:
-            await context.bot.send_document(chat_id=GROUP_ID, document=update.message.document.file_id, caption=update.message.caption, message_thread_id=thread_id)
-        elif update.message.video:
-            await context.bot.send_video(chat_id=GROUP_ID, video=update.message.video.file_id, caption=update.message.caption, message_thread_id=thread_id)
-        elif update.message.voice:
-            await context.bot.send_voice(chat_id=GROUP_ID, voice=update.message.voice.file_id, caption=update.message.caption, message_thread_id=thread_id)
-        elif update.message.audio:
-            await context.bot.send_audio(chat_id=GROUP_ID, audio=update.message.audio.file_id, caption=update.message.caption, message_thread_id=thread_id)
-        # Add other media types as needed (sticker, video_note, etc.)
-        else:
-            logger.info(f"Received unhandled message type from {username} ({chat_id})")
-            await update.message.reply_text("I can currently only forward text, photos, videos, and documents.")
-            return # Don't confirm if not forwarded
-        # Optionally, confirm to user message was forwarded (can be spammy)
-        # await update.message.reply_text("Your message has been forwarded to the support team.")
-
-    except BadRequest as e:
-        logger.error(f"BadRequest: Failed to send message from user {chat_id} to thread {thread_id}: {e}")
-        await update.message.reply_text("Sorry, there was an issue sending your message. Please try again.")
-    except Exception as e:
-        logger.error(f"Error handling message from user {chat_id} to thread {thread_id}: {e}", exc_info=True)
-        await update.message.reply_text("An unexpected error occurred. Please try sending your message again.")
+        conn = _connect()
+        conn.execute(
+            "UPDATE users SET is_closed=? WHERE chat_id=?",
+            (1 if closed else 0, chat_id),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        logger.error("set_closed: %s", e)
 
 
-async def forward_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This handler is for messages from admins in the group, within a topic
-    if not update.message or not update.message.is_topic_message or not update.message.message_thread_id:
-        # Ignore messages not in topics or general topic messages if not replies to bot's topic structure
-        # logger.debug("Ignoring non-topic message or message without thread_id in group.")
-        return
+def set_closed_by_thread(thread_id: int, closed: bool) -> None:
+    try:
+        conn = _connect()
+        conn.execute(
+            "UPDATE users SET is_closed=? WHERE thread_id=?",
+            (1 if closed else 0, thread_id),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        logger.error("set_closed_by_thread: %s", e)
 
-    message = update.message
-    admin_user = message.from_user
-    admin_username = admin_user.username or admin_user.first_name
 
-    # Check if the message is from a designated admin (optional, good for strictness)
-    # if admin_user.id not in ADMIN_USER_IDS:
-    #     logger.debug(f"Message in group topic {message.message_thread_id} from non-admin {admin_username} ({admin_user.id}). Ignoring.")
-    #     return
+def touch_last_message(chat_id: int) -> None:
+    try:
+        conn = _connect()
+        conn.execute(
+            "UPDATE users SET last_message_at=datetime('now') WHERE chat_id=?",
+            (chat_id,),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        logger.error("touch_last_message: %s", e)
 
-    thread_id = message.message_thread_id
-    user_chat_id = get_user_chat_id(thread_id)
 
-    if not user_chat_id:
-        logger.warning(f"No user found for thread ID: {thread_id} from admin {admin_username}. Possibly an old topic or direct message in topic.")
-        # Optionally reply to the admin in the topic:
-        # await message.reply_text("Could not find the original user for this topic. Was this topic created by the bot?")
-        return
+def get_all_users() -> list[dict]:
+    try:
+        conn = _connect()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM users").fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except sqlite3.Error as e:
+        logger.error("get_all_users: %s", e)
+        return []
 
+
+def get_stats() -> dict:
+    try:
+        conn = _connect()
+        total     = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active    = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE is_closed=0 AND is_banned=0"
+        ).fetchone()[0]
+        banned    = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE is_banned=1"
+        ).fetchone()[0]
+        today_msg = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE date(last_message_at)=date('now')"
+        ).fetchone()[0]
+        conn.close()
+        return {
+            "total": total,
+            "active": active,
+            "banned": banned,
+            "today_messages": today_msg,
+        }
+    except sqlite3.Error as e:
+        logger.error("get_stats: %s", e)
+        return {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. Media forwarding helpers
+# ──────────────────────────────────────────────────────────────────────────────
+async def forward_to_group(
+    context: ContextTypes.DEFAULT_TYPE, message, thread_id: int
+) -> bool:
+    """Forward any supported message type from a user to a group topic thread."""
+    bot = context.bot
+    cap = message.caption
     try:
         if message.text:
-            await context.bot.send_message(chat_id=user_chat_id, text=message.text)
+            await bot.send_message(GROUP_ID, message.text, message_thread_id=thread_id)
         elif message.photo:
-            await context.bot.send_photo(chat_id=user_chat_id, photo=message.photo[-1].file_id, caption=message.caption)
-        elif message.document:
-            await context.bot.send_document(chat_id=user_chat_id, document=message.document.file_id, caption=message.caption)
+            await bot.send_photo(GROUP_ID, message.photo[-1].file_id, caption=cap, message_thread_id=thread_id)
         elif message.video:
-            await context.bot.send_video(chat_id=user_chat_id, video=message.video.file_id, caption=message.caption)
+            await bot.send_video(GROUP_ID, message.video.file_id, caption=cap, message_thread_id=thread_id)
+        elif message.document:
+            await bot.send_document(GROUP_ID, message.document.file_id, caption=cap, message_thread_id=thread_id)
         elif message.voice:
-            await context.bot.send_voice(chat_id=user_chat_id, voice=message.voice.file_id, caption=message.caption)
+            await bot.send_voice(GROUP_ID, message.voice.file_id, caption=cap, message_thread_id=thread_id)
         elif message.audio:
-            await context.bot.send_audio(chat_id=user_chat_id, audio=message.audio.file_id, caption=message.caption)
-        # Add other media types as needed
+            await bot.send_audio(GROUP_ID, message.audio.file_id, caption=cap, message_thread_id=thread_id)
+        elif message.sticker:
+            await bot.send_sticker(GROUP_ID, message.sticker.file_id, message_thread_id=thread_id)
+        elif message.animation:
+            await bot.send_animation(GROUP_ID, message.animation.file_id, caption=cap, message_thread_id=thread_id)
+        elif message.video_note:
+            await bot.send_video_note(GROUP_ID, message.video_note.file_id, message_thread_id=thread_id)
+        elif message.location:
+            await bot.send_location(
+                GROUP_ID,
+                latitude=message.location.latitude,
+                longitude=message.location.longitude,
+                message_thread_id=thread_id,
+            )
+        elif message.contact:
+            await bot.send_contact(
+                GROUP_ID,
+                phone_number=message.contact.phone_number,
+                first_name=message.contact.first_name,
+                last_name=message.contact.last_name,
+                message_thread_id=thread_id,
+            )
         else:
-            logger.info(f"Admin {admin_username} sent unhandled message type to user for thread {thread_id}")
-            await message.reply_text("This message type cannot be forwarded to the user at this time.")
+            return False  # Unsupported type
+        return True
+    except (BadRequest, Forbidden) as e:
+        logger.error("forward_to_group thread=%s: %s", thread_id, e)
+        raise
 
+
+async def forward_to_user(
+    context: ContextTypes.DEFAULT_TYPE, message, user_chat_id: int
+) -> bool:
+    """Forward any supported message type from the group topic to a user."""
+    bot = context.bot
+    cap = message.caption
+    try:
+        if message.text:
+            await bot.send_message(user_chat_id, message.text)
+        elif message.photo:
+            await bot.send_photo(user_chat_id, message.photo[-1].file_id, caption=cap)
+        elif message.video:
+            await bot.send_video(user_chat_id, message.video.file_id, caption=cap)
+        elif message.document:
+            await bot.send_document(user_chat_id, message.document.file_id, caption=cap)
+        elif message.voice:
+            await bot.send_voice(user_chat_id, message.voice.file_id, caption=cap)
+        elif message.audio:
+            await bot.send_audio(user_chat_id, message.audio.file_id, caption=cap)
+        elif message.sticker:
+            await bot.send_sticker(user_chat_id, message.sticker.file_id)
+        elif message.animation:
+            await bot.send_animation(user_chat_id, message.animation.file_id, caption=cap)
+        elif message.video_note:
+            await bot.send_video_note(user_chat_id, message.video_note.file_id)
+        elif message.location:
+            await bot.send_location(
+                user_chat_id,
+                latitude=message.location.latitude,
+                longitude=message.location.longitude,
+            )
+        elif message.contact:
+            await bot.send_contact(
+                user_chat_id,
+                phone_number=message.contact.phone_number,
+                first_name=message.contact.first_name,
+                last_name=message.contact.last_name,
+            )
+        else:
+            return False
+        return True
+    except Forbidden:
+        logger.warning("forward_to_user: bot blocked by user %s", user_chat_id)
+        raise
+    except BadRequest as e:
+        logger.error("forward_to_user user=%s: %s", user_chat_id, e)
+        raise
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. User-facing command handlers
+# ──────────────────────────────────────────────────────────────────────────────
+WELCOME_TEXT = (
+    "👋 *Hello {name}!*\n\n"
+    "Welcome to our support bot. I'm here to connect you with our support team.\n\n"
+    "Simply type your message and our team will get back to you as soon as possible. "
+    "We aim to respond within a few hours.\n\n"
+    "📌 *Supported media:* text, photos, videos, files, voice messages, audio, "
+    "stickers, GIFs, video circles, location & contacts.\n\n"
+    "Use /help to see available commands."
+)
+
+HELP_TEXT = (
+    "🤖 *Support Bot — Commands*\n\n"
+    "/start — Start or resume your support session\n"
+    "/help  — Show this help message\n\n"
+    "_Just send a message to contact our support team._"
+)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg  = update.message
+    user = msg.from_user
+    chat_id  = msg.chat_id
+    username = user.username or user.first_name
+
+    row = get_user_row(chat_id)
+
+    # --- Existing active session ---
+    if row and row["thread_id"] and not row["is_closed"]:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Send a message", callback_data="noop"),
+        ]])
+        await msg.reply_text(
+            f"👋 *Hello {username}!*\n\n"
+            "You already have an active support session. "
+            "Just send your message here and we'll forward it to the team.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # --- Closed session: re-open ---
+    if row and row["is_closed"]:
+        set_closed(chat_id, False)
+        thread_id = row["thread_id"]
+        await msg.reply_text(
+            WELCOME_TEXT.format(name=username),
+            parse_mode="Markdown",
+        )
+        await context.bot.send_message(
+            GROUP_ID,
+            f"🔄 *Session re-opened* by {username} (ID: {chat_id}).",
+            message_thread_id=thread_id,
+            parse_mode="Markdown",
+        )
+        return
+
+    # --- Banned ---
+    if row and row["is_banned"]:
+        await msg.reply_text(
+            "⛔ Your account has been restricted from using this support bot. "
+            "Please contact us through another channel if you believe this is a mistake."
+        )
+        return
+
+    # --- New user: create forum topic ---
+    topic_name = f"🆕 {username} ({user.id})"
+    try:
+        topic = await context.bot.create_forum_topic(chat_id=GROUP_ID, name=topic_name)
+        thread_id = topic.message_thread_id
+
+        if not thread_id:
+            logger.error("create_forum_topic returned no thread_id for %s", username)
+            await msg.reply_text("❌ Couldn't create a support channel. Please try again later.")
+            return
+
+        save_user(chat_id, username, thread_id)
+
+        await msg.reply_text(
+            WELCOME_TEXT.format(name=username),
+            parse_mode="Markdown",
+        )
+
+        # Notify group with user card
+        await context.bot.send_message(
+            GROUP_ID,
+            f"🆕 *New support request*\n\n"
+            f"👤 *User:* {username}\n"
+            f"🆔 *Chat ID:* `{chat_id}`\n"
+            f"🪪 *User ID:* `{user.id}`\n"
+            f"📅 *Started:* {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"Reply here to send messages directly to the user.",
+            message_thread_id=thread_id,
+            parse_mode="Markdown",
+        )
 
     except BadRequest as e:
-        logger.error(f"BadRequest: Failed to send admin message from thread {thread_id} to user {user_chat_id}: {e}")
-        await message.reply_text(f"Failed to send your message to the user. Error: {e.message}") # Inform admin
+        logger.error("cmd_start BadRequest for %s (%s): %s", username, chat_id, e)
+        await msg.reply_text(
+            "❌ I encountered an issue setting up your support channel. "
+            "Please try again or contact an administrator directly."
+        )
     except Exception as e:
-        logger.error(f"Error forwarding admin message from thread {thread_id} to user {user_chat_id}: {e}", exc_info=True)
-        await message.reply_text("An unexpected error occurred while trying to send your message to the user.")
+        logger.error("cmd_start unexpected error for %s (%s): %s", username, chat_id, e, exc_info=True)
+        await msg.reply_text("❌ An unexpected error occurred. Please try again in a moment.")
 
 
-# --- Error Handler ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # For specific errors, you might want to inform the user if the update object is available
-    if isinstance(update, Update) and update.effective_message:
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. User message handler
+# ──────────────────────────────────────────────────────────────────────────────
+_SUPPORTED_USER_FILTERS = (
+    filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL |
+    filters.VOICE | filters.AUDIO | filters.Sticker.ALL |
+    filters.ANIMATION | filters.VIDEO_NOTE | filters.LOCATION | filters.CONTACT
+)
+
+
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    msg      = update.message
+    chat_id  = msg.chat_id
+    user     = msg.from_user
+    username = user.username or user.first_name
+
+    row = get_user_row(chat_id)
+
+    # No session
+    if not row or not row["thread_id"]:
+        await msg.reply_text(
+            "⚠️ You don't have an active support session.\n"
+            "Use /start to begin one."
+        )
+        return
+
+    # Banned
+    if row["is_banned"]:
+        await msg.reply_text("⛔ Your account is restricted. You cannot send messages.")
+        return
+
+    # Closed session — prompt to restart
+    if row["is_closed"]:
+        await msg.reply_text(
+            "ℹ️ Your previous support session was closed.\n"
+            "Use /start to open a new one."
+        )
+        return
+
+    # Rate limit
+    if is_rate_limited(chat_id):
+        await msg.reply_text(
+            f"⏳ You're sending messages too fast. Please wait a moment before sending again."
+        )
+        return
+
+    thread_id = row["thread_id"]
+    try:
+        forwarded = await forward_to_group(context, msg, thread_id)
+        if forwarded:
+            touch_last_message(chat_id)
+            # Delivery receipt: react with 👍
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    reaction=[ReactionTypeEmoji("👍")],
+                )
+            except Exception:
+                pass  # Reactions may not be supported in all clients — silently ignore
+        else:
+            await msg.reply_text("⚠️ This message type isn't supported yet.")
+    except BadRequest as e:
+        logger.error("handle_user_message BadRequest user=%s thread=%s: %s", chat_id, thread_id, e)
+        await msg.reply_text("❌ Failed to send your message. Please try again.")
+    except Exception as e:
+        logger.error("handle_user_message unexpected user=%s: %s", chat_id, e, exc_info=True)
+        await msg.reply_text("❌ An unexpected error occurred. Please try again.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. Admin message handler (group topic → user)
+# ──────────────────────────────────────────────────────────────────────────────
+async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.is_topic_message or not update.message.message_thread_id:
+        return
+
+    msg       = update.message
+    thread_id = msg.message_thread_id
+    user_chat_id = get_chat_id(thread_id)
+
+    if not user_chat_id:
+        return  # Topic not managed by this bot
+
+    try:
+        forwarded = await forward_to_user(context, msg, user_chat_id)
+        if not forwarded:
+            await msg.reply_text("⚠️ This message type cannot be forwarded to the user.")
+    except Forbidden:
+        await msg.reply_text(
+            "⛔ *Cannot deliver message* — the user has blocked the bot.",
+            parse_mode="Markdown",
+        )
+    except BadRequest as e:
+        logger.error("handle_admin_message BadRequest thread=%s user=%s: %s", thread_id, user_chat_id, e)
+        await msg.reply_text(f"❌ Failed to send to user: {e.message}")
+    except Exception as e:
+        logger.error("handle_admin_message unexpected thread=%s user=%s: %s", thread_id, user_chat_id, e, exc_info=True)
+        await msg.reply_text("❌ An unexpected error occurred.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. Admin commands (issued inside a group topic)
+# ──────────────────────────────────────────────────────────────────────────────
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /close — resolve and close the current support ticket."""
+    msg       = update.message
+    thread_id = msg.message_thread_id if msg.is_topic_message else None
+
+    if not thread_id:
+        await msg.reply_text("⚠️ This command must be used inside a support topic.")
+        return
+
+    user_chat_id = get_chat_id(thread_id)
+    if not user_chat_id:
+        await msg.reply_text("⚠️ No user linked to this topic.")
+        return
+
+    set_closed_by_thread(thread_id, True)
+
+    # Notify user
+    try:
+        await context.bot.send_message(
+            user_chat_id,
+            "✅ *Your support ticket has been resolved.*\n\n"
+            "Thank you for reaching out! If you need further assistance, "
+            "feel free to use /start to open a new session.",
+            parse_mode="Markdown",
+        )
+    except Forbidden:
+        logger.warning("cmd_close: bot blocked by user %s", user_chat_id)
+
+    # Close the forum topic
+    try:
+        await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
+    except BadRequest as e:
+        logger.warning("cmd_close: could not close forum topic %s: %s", thread_id, e)
+
+    await msg.reply_text(
+        "✅ *Ticket closed.*\n"
+        "The user has been notified. The topic is now archived.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /ban — ban the user linked to this topic."""
+    msg       = update.message
+    thread_id = msg.message_thread_id if msg.is_topic_message else None
+
+    if not thread_id:
+        await msg.reply_text("⚠️ This command must be used inside a support topic.")
+        return
+
+    user_chat_id = get_chat_id(thread_id)
+    if not user_chat_id:
+        await msg.reply_text("⚠️ No user linked to this topic.")
+        return
+
+    set_banned(user_chat_id, True)
+    set_closed_by_thread(thread_id, True)
+
+    try:
+        await context.bot.send_message(
+            user_chat_id,
+            "⛔ *You have been restricted* from using this support bot.\n"
+            "If you believe this is a mistake, please contact us through another channel.",
+            parse_mode="Markdown",
+        )
+    except Forbidden:
+        pass
+
+    try:
+        await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
+    except BadRequest:
+        pass
+
+    await msg.reply_text(
+        f"🚫 *User {user_chat_id} has been banned* and their session closed.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /unban — unban the user linked to this topic."""
+    msg       = update.message
+    thread_id = msg.message_thread_id if msg.is_topic_message else None
+
+    if not thread_id:
+        await msg.reply_text("⚠️ This command must be used inside a support topic.")
+        return
+
+    user_chat_id = get_chat_id(thread_id)
+    if not user_chat_id:
+        await msg.reply_text("⚠️ No user linked to this topic.")
+        return
+
+    set_banned(user_chat_id, False)
+
+    try:
+        await context.bot.send_message(
+            user_chat_id,
+            "✅ *Your restriction has been lifted.*\n"
+            "You can now use /start to open a new support session.",
+            parse_mode="Markdown",
+        )
+    except Forbidden:
+        pass
+
+    await msg.reply_text(
+        f"✅ *User {user_chat_id} has been unbanned.*",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /stats — show bot statistics (DM only)."""
+    msg = update.message
+    if msg.chat.type != "private":
+        await msg.reply_text("📊 Stats command only works in private chat with the bot.")
+        return
+
+    if msg.from_user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("⛔ You are not authorised to use this command.")
+        return
+
+    s = get_stats()
+    text = (
+        "📊 *Support Bot Statistics*\n\n"
+        f"👥 Total sessions: *{s.get('total', 0)}*\n"
+        f"✅ Active sessions: *{s.get('active', 0)}*\n"
+        f"🚫 Banned users:   *{s.get('banned', 0)}*\n"
+        f"💬 Active today:   *{s.get('today_messages', 0)}*"
+    )
+    await msg.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /broadcast <message> — send a message to all non-banned users."""
+    msg = update.message
+    if msg.chat.type != "private":
+        await msg.reply_text("📢 Broadcast command only works in private chat with the bot.")
+        return
+
+    if msg.from_user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("⛔ You are not authorised to use this command.")
+        return
+
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await msg.reply_text("Usage: /broadcast <your message>")
+        return
+
+    users     = get_all_users()
+    targets   = [u for u in users if not u["is_banned"]]
+    sent      = 0
+    failed    = 0
+
+    status_msg = await msg.reply_text(f"📢 Broadcasting to {len(targets)} users…")
+
+    for u in targets:
         try:
-            # Avoid sending error messages for some known issues, e.g. if a user blocks the bot
-            if isinstance(context.error, BadRequest) and "bot was blocked by the user" in str(context.error).lower():
-                logger.warning(f"Bot was blocked by user {update.effective_chat.id if update.effective_chat else 'N/A'}. Cannot send message.")
-                return # Don't try to send a message back
-
-            # await update.effective_message.reply_text(
-            #     "Sorry, an unexpected error occurred. The developers have been notified."
-            # )
+            await context.bot.send_message(
+                u["chat_id"],
+                f"📢 *Message from Support Team:*\n\n{text}",
+                parse_mode="Markdown",
+            )
+            sent += 1
+            await asyncio.sleep(0.05)  # Respect Telegram rate limits
+        except Forbidden:
+            set_banned(u["chat_id"], True)
+            failed += 1
         except Exception as e:
-            logger.error(f"Exception in error_handler while trying to inform user: {e}")
+            logger.warning("broadcast failed for %s: %s", u["chat_id"], e)
+            failed += 1
+
+    await status_msg.edit_text(
+        f"📢 *Broadcast complete*\n\n"
+        f"✅ Sent: {sent}\n"
+        f"❌ Failed: {failed}",
+        parse_mode="Markdown",
+    )
 
 
-# --- Flask Webserver for Webhook ---
-@app.route('/keep_alive', methods=['GET'])
-def keep_alive():
-    return "Bot is running!", 200
+# ──────────────────────────────────────────────────────────────────────────────
+# 11. Callback query handler (inline keyboard noop)
+# ──────────────────────────────────────────────────────────────────────────────
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
 
-@app.route(f'/webhook/{TOKEN}', methods=['POST'])
-def webhook_handler_route():
-    global PTB_EVENT_LOOP # Ensure you're using the global variable
 
-    json_data = request.get_json()
-    if not json_data:
-        logger.warning("Received empty JSON in webhook")
-        return "Empty request", 400
-    update = Update.de_json(json_data, application.bot)
+# ──────────────────────────────────────────────────────────────────────────────
+# 12. Global error handler
+# ──────────────────────────────────────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    logger.error("Unhandled exception:", exc_info=err)
 
-    if PTB_EVENT_LOOP:
-        # Submit process_update to be run on PTB's main event loop
-        future = asyncio.run_coroutine_threadsafe(application.process_update(update), PTB_EVENT_LOOP)
-        try:
-            # For webhooks, you usually want to return "OK" quickly.
-            # You can optionally wait for a very short timeout if you want to ensure
-            # the task was successfully submitted or catch immediate errors from submission.
-            # future.result(timeout=1) # Example: wait up to 1 second
-            pass
-        except Exception as e:
-            logger.error(f"Error when submitting/awaiting process_update via run_coroutine_threadsafe: {e}")
-            # Depending on the error, you might want to return a 500 status
-            # return "Error processing update", 500
+    if isinstance(err, Forbidden):
+        chat_id = (
+            update.effective_chat.id
+            if isinstance(update, Update) and update.effective_chat
+            else None
+        )
+        if chat_id:
+            logger.warning("Bot blocked by user %s — marking as banned.", chat_id)
+            set_banned(chat_id, True)
+        return
+
+    if isinstance(err, NetworkError):
+        logger.warning("NetworkError (transient): %s", err)
+        return
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 13. Webhook setup
+# ──────────────────────────────────────────────────────────────────────────────
+async def set_webhook() -> None:
+    webhook_url = f"{WEBSITE_URL}/webhook/{TOKEN}"
+    try:
+        await ptb_application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        logger.info("Webhook set: %s", webhook_url)
+    except NetworkError as e:
+        logger.error("Network error setting webhook: %s", e)
+    except Exception as e:
+        logger.error("Unexpected error setting webhook: %s", e)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 14. PTB setup & dedicated event loop thread
+# ──────────────────────────────────────────────────────────────────────────────
+async def _ptb_setup_and_run() -> None:
+    """Initialise DB, register handlers, set webhook, and keep PTB loop alive."""
+    init_db()
+
+    # ── User commands ──
+    ptb_application.add_handler(CommandHandler("start", cmd_start))
+    ptb_application.add_handler(CommandHandler("help",  cmd_help))
+
+    # ── Admin commands (private DM) ──
+    ptb_application.add_handler(CommandHandler("stats",     cmd_stats))
+    ptb_application.add_handler(CommandHandler("broadcast", cmd_broadcast))
+
+    # ── Admin commands (group topic) ──
+    group_cmd_filter = filters.Chat(GROUP_ID) & filters.UpdateType.MESSAGE
+    ptb_application.add_handler(CommandHandler("close", cmd_close,  filters=group_cmd_filter))
+    ptb_application.add_handler(CommandHandler("ban",   cmd_ban,    filters=group_cmd_filter))
+    ptb_application.add_handler(CommandHandler("unban", cmd_unban,  filters=group_cmd_filter))
+
+    # ── User messages (private) ──
+    user_msg_filter = (
+        filters.ChatType.PRIVATE & ~filters.COMMAND & _SUPPORTED_USER_FILTERS
+    )
+    ptb_application.add_handler(MessageHandler(user_msg_filter, handle_user_message))
+
+    # ── Admin replies (group topic) ──
+    if ADMIN_USER_IDS:
+        admin_msg_filter = (
+            filters.Chat(GROUP_ID) &
+            filters.User(user_id=ADMIN_USER_IDS) &
+            ~filters.COMMAND &
+            _SUPPORTED_USER_FILTERS &
+            filters.UpdateType.MESSAGE
+        )
+        ptb_application.add_handler(MessageHandler(admin_msg_filter, handle_admin_message))
     else:
-        logger.error("PTB application event loop (PTB_EVENT_LOOP) is not available. Update cannot be processed.")
-        return "Internal server error: Bot loop not configured", 500
+        logger.warning("No TELEGRAM_ADMINS defined — admin reply forwarding is disabled.")
+
+    # ── Inline keyboard callbacks ──
+    ptb_application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # ── Error handler ──
+    ptb_application.add_error_handler(error_handler)
+
+    await ptb_application.initialize()
+    logger.info("PTB application initialised.")
+
+    await set_webhook()
+    logger.info("PTB setup complete. Loop running forever.")
+
+
+def _start_ptb_thread() -> None:
+    """Entry point for the dedicated PTB asyncio thread."""
+    global PTB_EVENT_LOOP
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    PTB_EVENT_LOOP = loop
+
+    try:
+        loop.run_until_complete(_ptb_setup_and_run())
+        PTB_INITIALIZED_EVENT.set()
+        loop.run_forever()
+    except Exception as e:
+        logger.critical("Critical error in PTB thread: %s", e, exc_info=True)
+        PTB_INITIALIZED_EVENT.set()  # Unblock webhook handler even on failure
+    finally:
+        logger.info("PTB thread exiting.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 15. Flask routes
+# ──────────────────────────────────────────────────────────────────────────────
+@flask_app.route("/keep_alive", methods=["GET"])
+def keep_alive():
+    return "✅ Bot is running.", 200
+
+
+@flask_app.route("/health", methods=["GET"])
+def health():
+    loop_ok = PTB_EVENT_LOOP is not None and PTB_EVENT_LOOP.is_running()
+    return {
+        "status": "ok" if loop_ok else "degraded",
+        "ptb_loop_running": loop_ok,
+    }, 200 if loop_ok else 503
+
+
+@flask_app.route(f"/webhook/{TOKEN}", methods=["POST"])
+def webhook_route():
+    if not PTB_INITIALIZED_EVENT.is_set():
+        logger.info("Webhook: waiting for PTB init…")
+        ready = PTB_INITIALIZED_EVENT.wait(timeout=15.0)
+        if not ready:
+            logger.error("Webhook: PTB init timed out.")
+            return "Service unavailable: bot not ready", 503
+
+    json_data = flask_request.get_json(silent=True)
+    if not json_data:
+        return "Bad request: empty body", 400
+
+    if PTB_EVENT_LOOP and PTB_EVENT_LOOP.is_running():
+        try:
+            update = Update.de_json(json_data, ptb_application.bot)
+            asyncio.run_coroutine_threadsafe(
+                ptb_application.process_update(update), PTB_EVENT_LOOP
+            )
+        except Exception as e:
+            logger.error("webhook_route: failed to submit update: %s", e, exc_info=True)
+            return "Internal server error", 500
+    else:
+        logger.error("webhook_route: PTB event loop not running.")
+        return "Internal server error: loop inactive", 500
 
     return "OK", 200
 
-def run_flask():
-    logger.info(f"Starting Flask server on host 0.0.0.0 port {PORT}")
-    # Use a production-ready WSGI server like gunicorn or waitress in production
-    app.run(host='0.0.0.0', port=PORT, debug=False) # Set debug=False for production
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 16. Start PTB thread when module is loaded (Gunicorn / direct)
+# ──────────────────────────────────────────────────────────────────────────────
+def _ensure_ptb_started() -> None:
+    global PTB_THREAD
+    if PTB_THREAD is None or not PTB_THREAD.is_alive():
+        logger.info("Starting PTB dedicated loop thread.")
+        PTB_THREAD = threading.Thread(target=_start_ptb_thread, daemon=True, name="PTBThread")
+        PTB_THREAD.start()
 
 
-# --- Main Bot Logic ---
-async def main():
-    global PTB_EVENT_LOOP # Declare that we are going to assign to the global variable
+_ensure_ptb_started()
 
-    init_db()
-
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-
-    # Handler for user messages (private chat, not commands)
-    user_message_filters = (
-        filters.ChatType.PRIVATE & ~filters.COMMAND &
-        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO) # Corrected here
-    )
-    application.add_handler(MessageHandler(user_message_filters, handle_message))
-
-    # Handler for admin messages in the group topic (ensure ADMINS is populated)
-    if ADMIN_USER_IDS: # Only add admin handler if ADMINS are defined
-        admin_message_filters = (
-            filters.Chat(GROUP_ID) & filters.User(user_id=ADMIN_USER_IDS) & ~filters.COMMAND &
-            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE | filters.AUDIO) & # Corrected here
-            filters.UpdateType.MESSAGE # Ensure it's a new message
-        )
-        application.add_handler(MessageHandler(admin_message_filters, forward_admin_message))
+# ──────────────────────────────────────────────────────────────────────────────
+# 17. Direct run (python main.py) — for local dev / simple deployment
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    PTB_INITIALIZED_EVENT.wait()
+    if PTB_EVENT_LOOP and PTB_EVENT_LOOP.is_running():
+        logger.info("Starting Flask dev server on port %s…", PORT)
+        flask_app.run(host="0.0.0.0", port=PORT, debug=False)
     else:
-        logger.warning("TELEGRAM_ADMINS not defined or empty. Admin reply forwarding will not work.")
-
-    application.add_error_handler(error_handler)
-
-    # Initialize the PTB application
-    await application.initialize()
-    logger.info("Telegram Application initialized.")
-
-    # Capture the event loop PTB is running on
-    PTB_EVENT_LOOP = asyncio.get_running_loop()
-    logger.info(f"PTB Event Loop captured: {PTB_EVENT_LOOP}")
-
-    # Set the webhook
-    await set_webhook()
-
-    # Start the Flask app in a separate daemon thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask thread started and running in background.")
-
-    try:
-        logger.info("Bot is running. Main asyncio loop active. Press Ctrl+C to stop.")
-        # This keeps the main asyncio loop (PTB_EVENT_LOOP) running
-        # so it can process tasks submitted by the Flask webhook handler.
-        while True:
-            await asyncio.sleep(3600) # Keep alive, adjust as needed
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutdown signal (KeyboardInterrupt/SystemExit) received in main loop.")
-    finally:
-        logger.info("Initiating PTB application shutdown...")
-        await application.shutdown()
-        logger.info("PTB application shutdown complete.")
-
-
-if __name__ == '__main__':    
-    if not TOKEN:
-        # logger might not be configured if this is the first line __main__ and it fails
-        print("CRITICAL: TELEGRAM_BOT_TOKEN environment variable not found! Exiting.") 
-        exit(1)
-    if os.getenv('TELEGRAM_GROUP_ID') is None:
-        print("CRITICAL: TELEGRAM_GROUP_ID environment variable not found! Exiting.")
-        exit(1)
-    if not WEBSITE_URL:
-        # logger might not be configured here either
-        print("WARNING: WEBSITE_URL environment variable not found! Webhook setup will fail if not already set.")
-
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        # Log critical errors during startup or main execution
-        if 'logger' in globals() and logger: # Check if logger is initialized
-            logger.critical(f"Critical error during bot execution: {e}", exc_info=True)
-        else:
-            print(f"CRITICAL error during bot execution (logger not available): {e}")
-    finally:
-        if 'logger' in globals() and logger:
-            logger.info("Exiting application.")
-        else:
-            print("Exiting application (logger not available).")
+        logger.critical("PTB event loop failed to start. Exiting.")
+        raise SystemExit(1)
