@@ -1,6 +1,7 @@
 # Sensitive / generated files
 .env
 *.db
+DESIGN-cursor.md
 
 # Python
 __pycache__/
