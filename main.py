@@ -382,20 +382,34 @@ async def forward_to_user(
 # 7. User-facing command handlers
 # ──────────────────────────────────────────────────────────────────────────────
 WELCOME_TEXT = (
-    "👋 *Hello {name}!*\n\n"
-    "Welcome to our support bot. I'm here to connect you with our support team.\n\n"
-    "Simply type your message and our team will get back to you as soon as possible. "
-    "We aim to respond within a few hours.\n\n"
-    "📌 *Supported media:* text, photos, videos, files, voice messages, audio, "
-    "stickers, GIFs, video circles, location & contacts.\n\n"
-    "Use /help to see available commands."
+    "⚡ *Telegram Support Desk* ⚡\n\n"
+    "👋 *Hello {name}!*\n"
+    "Welcome to our support desk. We are here to help you.\n\n"
+    "💬 *How it works:*\n"
+    "1. Type your message and hit send.\n"
+    "2. Our support team will receive it and reply directly.\n"
+    "3. We aim to respond within a few hours.\n\n"
+    "📌 *Supported Media:*\n"
+    "• Text & Links\n"
+    "• Photos & Videos\n"
+    "• Voice messages & Audio\n"
+    "• Stickers & GIFs\n"
+    "• Locations & Contacts\n\n"
+    "⚙️ *Available Commands:*\n"
+    "• /start — Restart support session\n"
+    "• /close — Close your active session\n"
+    "• /help  — View help instructions"
 )
 
 HELP_TEXT = (
-    "🤖 *Support Bot — Commands*\n\n"
-    "/start — Start or resume your support session\n"
-    "/help  — Show this help message\n\n"
-    "_Just send a message to contact our support team._"
+    "ℹ️ *Support Bot Guide*\n\n"
+    "This bot acts as a direct line to our support team. "
+    "Every message you send here is relayed directly to our staff.\n\n"
+    "⌨️ *Commands:*\n"
+    "• /start — Start or resume your support session\n"
+    "• /close — Close your active session\n"
+    "• /help  — Display this guide\n\n"
+    "💡 _Simply type a message and press send to get in touch!_"
 )
 
 
@@ -407,36 +421,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     row = get_user_row(chat_id)
 
-    # --- Existing active session ---
-    if row and row["thread_id"] and not row["is_closed"]:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💬 Send a message", callback_data="noop"),
-        ]])
-        await msg.reply_text(
-            f"👋 *Hello {username}!*\n\n"
-            "You already have an active support session. "
-            "Just send your message here and we'll forward it to the team.",
-            parse_mode="Markdown",
-            reply_markup=kb,
-        )
-        return
-
-    # --- Closed session: re-open ---
-    if row and row["is_closed"]:
-        set_closed(chat_id, False)
-        thread_id = row["thread_id"]
-        await msg.reply_text(
-            WELCOME_TEXT.format(name=username),
-            parse_mode="Markdown",
-        )
-        await context.bot.send_message(
-            GROUP_ID,
-            f"🔄 *Session re-opened* by {username} (ID: {chat_id}).",
-            message_thread_id=thread_id,
-            parse_mode="Markdown",
-        )
-        return
-
     # --- Banned ---
     if row and row["is_banned"]:
         await msg.reply_text(
@@ -445,7 +429,84 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # --- New user: create forum topic ---
+    # Check if thread is valid if user has a thread_id
+    thread_exists = False
+    if row and row["thread_id"]:
+        thread_id = row["thread_id"]
+        try:
+            # Send a typing chat action as a lightweight check to verify if the thread still exists.
+            await context.bot.send_chat_action(
+                chat_id=GROUP_ID,
+                action="typing",
+                message_thread_id=thread_id
+            )
+            thread_exists = True
+        except BadRequest as e:
+            if "thread not found" in str(e).lower():
+                thread_exists = False
+                logger.info("Thread %s not found for user %s (probably deleted by admin).", thread_id, chat_id)
+            else:
+                thread_exists = True
+        except Exception:
+            # Assume thread exists on other errors (like connection problems) to avoid recreation loops
+            thread_exists = True
+
+    if row and row["thread_id"] and thread_exists:
+        # --- Existing active session ---
+        if not row["is_closed"]:
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help"),
+                    InlineKeyboardButton("🔒 Close Session", callback_data=f"user_close:{chat_id}:{thread_id}")
+                ]
+            ])
+            await msg.reply_text(
+                f"👋 *Hello {username}!*\n\n"
+                "You already have an active support session. "
+                "Just send your message here and we'll forward it to the team.",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+            return
+        # --- Closed session: re-open ---
+        else:
+            set_closed(chat_id, False)
+            thread_id = row["thread_id"]
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help"),
+                    InlineKeyboardButton("🔒 Close Session", callback_data=f"user_close:{chat_id}:{thread_id}")
+                ]
+            ])
+            await msg.reply_text(
+                WELCOME_TEXT.format(name=username),
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+            
+            admin_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Resolve & Close", callback_data=f"admin_close:{chat_id}:{thread_id}"),
+                    InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban:{chat_id}:{thread_id}")
+                ]
+            ])
+            await context.bot.send_message(
+                GROUP_ID,
+                f"🔄 *Support Ticket Re-opened*\n"
+                f"────────────────────────\n"
+                f"👤 *User:* {username}\n"
+                f"🆔 *Chat ID:* `{chat_id}`\n"
+                f"🪪 *User ID:* `{user.id}`\n"
+                f"📅 *Opened At:* `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`\n"
+                f"────────────────────────\n"
+                f"Reply here to send messages directly to the user.",
+                message_thread_id=thread_id,
+                parse_mode="Markdown",
+                reply_markup=admin_kb,
+            )
+            return
+
+    # --- New user or recreated session ---
     topic_name = f"🆕 {username} ({user.id})"
     try:
         topic = await context.bot.create_forum_topic(chat_id=GROUP_ID, name=topic_name)
@@ -458,22 +519,40 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         save_user(chat_id, username, thread_id)
 
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help"),
+                InlineKeyboardButton("🔒 Close Session", callback_data=f"user_close:{chat_id}:{thread_id}")
+            ]
+        ])
         await msg.reply_text(
             WELCOME_TEXT.format(name=username),
             parse_mode="Markdown",
+            reply_markup=kb,
         )
 
         # Notify group with user card
+        title = "🔄 *Support Ticket Re-created*" if row else "🎫 *New Support Ticket Created*"
+        notice = "\n\n⚠️ *Notice:* The previous thread was deleted by an admin." if row else ""
+        admin_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Resolve & Close", callback_data=f"admin_close:{chat_id}:{thread_id}"),
+                InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban:{chat_id}:{thread_id}")
+            ]
+        ])
         await context.bot.send_message(
             GROUP_ID,
-            f"🆕 *New support request*\n\n"
+            f"{title}\n"
+            f"────────────────────────\n"
             f"👤 *User:* {username}\n"
             f"🆔 *Chat ID:* `{chat_id}`\n"
             f"🪪 *User ID:* `{user.id}`\n"
-            f"📅 *Started:* {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"📅 *Opened At:* `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`\n"
+            f"────────────────────────{notice}\n"
             f"Reply here to send messages directly to the user.",
             message_thread_id=thread_id,
             parse_mode="Markdown",
+            reply_markup=admin_kb,
         )
 
     except BadRequest as e:
@@ -489,6 +568,38 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+
+async def cmd_user_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User command: /close — close their own support session from PM."""
+    msg = update.message
+    chat_id = msg.chat_id
+
+    row = get_user_row(chat_id)
+    if not row or not row["thread_id"] or row["is_closed"]:
+        await msg.reply_text("⚠️ You do not have an active support session.")
+        return
+
+    thread_id = row["thread_id"]
+    set_closed(chat_id, True)
+
+    await msg.reply_text(
+        "✅ *Your support session has been closed.*\n\n"
+        "If you need help in the future, just send a new message or run /start.",
+        parse_mode="Markdown"
+    )
+
+    # Notify admin group
+    try:
+        await context.bot.send_message(
+            GROUP_ID,
+            "🔒 *Ticket closed by the user.*",
+            message_thread_id=thread_id,
+            parse_mode="Markdown"
+        )
+        await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
+    except Exception as e:
+        logger.warning("cmd_user_close: could not notify group or close topic: %s", e)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -557,8 +668,60 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await msg.reply_text("⚠️ This message type isn't supported yet.")
     except BadRequest as e:
-        logger.error("handle_user_message BadRequest user=%s thread=%s: %s", chat_id, thread_id, e)
-        await msg.reply_text("❌ Failed to send your message. Please try again.")
+        if "thread not found" in str(e).lower():
+            logger.info("Thread %s was deleted by admin. Re-creating support thread for user %s.", thread_id, chat_id)
+            topic_name = f"🆕 {username} ({user.id})"
+            try:
+                topic = await context.bot.create_forum_topic(chat_id=GROUP_ID, name=topic_name)
+                new_thread_id = topic.message_thread_id
+                if not new_thread_id:
+                    raise Exception("Failed to obtain new thread ID during re-creation")
+                
+                save_user(chat_id, username, new_thread_id)
+                
+                admin_kb = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Resolve & Close", callback_data=f"admin_close:{chat_id}:{new_thread_id}"),
+                        InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban:{chat_id}:{new_thread_id}")
+                    ]
+                ])
+                # Notify group with user card (recreated)
+                await context.bot.send_message(
+                    GROUP_ID,
+                    f"🔄 *Support Ticket Re-created*\n"
+                    f"────────────────────────\n"
+                    f"👤 *User:* {username}\n"
+                    f"🆔 *Chat ID:* `{chat_id}`\n"
+                    f"🪪 *User ID:* `{user.id}`\n"
+                    f"📅 *Opened At:* `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`\n"
+                    f"────────────────────────\n"
+                    f"⚠️ *Notice:* The previous thread was deleted by an admin.\n\n"
+                    f"Reply here to send messages directly to the user.",
+                    message_thread_id=new_thread_id,
+                    parse_mode="Markdown",
+                    reply_markup=admin_kb,
+                )
+                
+                # Try forwarding the message to the new thread
+                forwarded = await forward_to_group(context, msg, new_thread_id)
+                if forwarded:
+                    touch_last_message(chat_id)
+                    try:
+                        await context.bot.set_message_reaction(
+                            chat_id=chat_id,
+                            message_id=msg.message_id,
+                            reaction=[ReactionTypeEmoji("👍")],
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await msg.reply_text("⚠️ This message type isn't supported yet.")
+            except Exception as re_err:
+                logger.error("Failed to re-create support thread for user %s: %s", chat_id, re_err, exc_info=True)
+                await msg.reply_text("❌ Failed to send your message. Please try again.")
+        else:
+            logger.error("handle_user_message BadRequest user=%s thread=%s: %s", chat_id, thread_id, e)
+            await msg.reply_text("❌ Failed to send your message. Please try again.")
     except Exception as e:
         logger.error("handle_user_message unexpected user=%s: %s", chat_id, e, exc_info=True)
         await msg.reply_text("❌ An unexpected error occurred. Please try again.")
@@ -782,7 +945,117 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # 11. Callback query handler (inline keyboard noop)
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "noop":
+        await query.answer()
+        return
+
+    # User guide request
+    if data == "user_help":
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=HELP_TEXT,
+            parse_mode="Markdown"
+        )
+        return
+
+    # User close ticket request
+    if data.startswith("user_close:"):
+        parts = data.split(":")
+        target_chat_id = int(parts[1])
+        thread_id = int(parts[2])
+
+        row = get_user_row(target_chat_id)
+        if row and not row["is_closed"]:
+            set_closed(target_chat_id, True)
+
+            await query.edit_message_text(
+                "✅ *Your support ticket has been closed.*\n\n"
+                "Thank you! Feel free to send a message or run /start to open a new session.",
+                parse_mode="Markdown"
+            )
+
+            # Notify admins in group
+            try:
+                await context.bot.send_message(
+                    GROUP_ID,
+                    "🔒 *Ticket closed by the user.*",
+                    message_thread_id=thread_id,
+                    parse_mode="Markdown"
+                )
+                await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
+            except Exception as e:
+                logger.warning("user_close callback: failed to close thread/notify: %s", e)
+            await query.answer("Support ticket closed.")
+        else:
+            await query.answer("Your ticket is already closed.")
+        return
+
+    # Verify admin permissions for admin actions
+    if data.startswith("admin_"):
+        if user_id not in ADMIN_USER_IDS:
+            await query.answer("⛔ You are not authorised to perform this action.", show_alert=True)
+            return
+
+        parts = data.split(":")
+        action = parts[0]
+        target_chat_id = int(parts[1])
+        thread_id = int(parts[2])
+
+        if action == "admin_close":
+            set_closed_by_thread(thread_id, True)
+            try:
+                await context.bot.send_message(
+                    target_chat_id,
+                    "✅ *Your support ticket has been resolved.*\n\n"
+                    "Thank you for reaching out! If you need further assistance, "
+                    "feel free to use /start to open a new session.",
+                    parse_mode="Markdown",
+                )
+            except Forbidden:
+                pass
+
+            try:
+                await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
+            except BadRequest as e:
+                logger.warning("handle_callback admin_close: could not close forum topic %s: %s", thread_id, e)
+
+            await query.edit_message_text(
+                query.message.text + "\n\n✅ *Ticket closed by admin.*",
+                parse_mode="Markdown"
+            )
+            await query.answer("Ticket closed.")
+
+        elif action == "admin_ban":
+            set_banned(target_chat_id, True)
+            set_closed_by_thread(thread_id, True)
+            try:
+                await context.bot.send_message(
+                    target_chat_id,
+                    "⛔ *You have been restricted* from using this support bot.\n"
+                    "If you believe this is a mistake, please contact us through another channel.",
+                    parse_mode="Markdown",
+                )
+            except Forbidden:
+                pass
+
+            try:
+                await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
+            except BadRequest:
+                pass
+
+            await query.edit_message_text(
+                query.message.text + f"\n\n🚫 *User {target_chat_id} has been banned.*",
+                parse_mode="Markdown"
+            )
+            await query.answer("User banned.", show_alert=True)
+        return
+
+    await query.answer()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -832,6 +1105,8 @@ async def _ptb_setup_and_run() -> None:
     # ── User commands ──
     ptb_application.add_handler(CommandHandler("start", cmd_start))
     ptb_application.add_handler(CommandHandler("help",  cmd_help))
+    user_cmd_filter = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+    ptb_application.add_handler(CommandHandler("close", cmd_user_close, filters=user_cmd_filter))
 
     # ── Admin commands (private DM) ──
     ptb_application.add_handler(CommandHandler("stats",     cmd_stats))
