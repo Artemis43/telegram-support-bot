@@ -12,13 +12,15 @@ Environment variables (see .env.example):
   TELEGRAM_GROUP_ID   — Forum-enabled group chat ID
   TELEGRAM_ADMINS     — Comma-separated admin user IDs
   PORT                — Flask port (default: 8443)
-  WEBSITE_URL         — Public HTTPS URL for webhook
+  WEBSITE_URL         — Public HTTPS URL for webhook (not needed when USE_POLLING=true)
+  USE_POLLING         — Set to "true" to use long-polling instead of a webhook
   DB_PATH             — Path to SQLite DB file (default: bot_data.db)
   RATE_LIMIT_MAX      — Max messages per window per user (default: 5)
   RATE_LIMIT_WINDOW   — Rate limit window in seconds (default: 10)
 """
 
 import os
+import shutil
 import logging
 import sqlite3
 import asyncio
@@ -30,11 +32,11 @@ from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, InputFile
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, CallbackQueryHandler
+    filters, ContextTypes, CallbackQueryHandler, ApplicationHandlerStop
 )
 from telegram.error import NetworkError, BadRequest, Forbidden
 
@@ -52,6 +54,7 @@ ADMIN_USER_IDS = [
 ]
 PORT           = int(os.getenv("PORT", "8443"))
 WEBSITE_URL    = os.getenv("WEBSITE_URL", "")
+USE_POLLING    = os.getenv("USE_POLLING", "").lower() in ("1", "true", "yes")
 DB_PATH        = os.getenv("DB_PATH", "bot_data.db")
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "10"))  # seconds
@@ -63,8 +66,8 @@ if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
 if not GROUP_ID:
     raise ValueError("TELEGRAM_GROUP_ID is not set.")
-if not WEBSITE_URL:
-    raise ValueError("WEBSITE_URL is not set.")
+if not WEBSITE_URL and not USE_POLLING:
+    raise ValueError("WEBSITE_URL is not set. Set it, or set USE_POLLING=true for polling mode.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. Logging
@@ -116,6 +119,10 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    # Ensure the DB directory exists (e.g. a mounted /data volume on the VPS).
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = _connect()
     cur = conn.cursor()
     cur.executescript("""
@@ -942,6 +949,158 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 10b. Admin DB backup / restore (DM only)
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin user IDs that ran /restore and are awaiting a .db upload.
+_awaiting_restore: set[int] = set()
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _is_valid_sqlite(path: str) -> tuple[bool, str]:
+    """Return (ok, detail): verify the SQLite header then run PRAGMA integrity_check."""
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(16) != _SQLITE_MAGIC:
+                return False, "not a SQLite database (bad header)"
+    except OSError as e:
+        return False, f"cannot read file: {e}"
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        return False, f"integrity check error: {e}"
+    if not result or result[0] != "ok":
+        return False, f"integrity check failed: {result[0] if result else 'no result'}"
+    return True, "ok"
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /backup — DM the admin a consistent snapshot of the database."""
+    msg = update.message
+    if msg.chat.type != "private":
+        await msg.reply_text("📦 Backup only works in private chat with the bot.")
+        return
+    if msg.from_user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("⛔ You are not authorised to use this command.")
+        return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tmp_path = f"{DB_PATH}.snap_{ts}"
+    try:
+        # Consistent online snapshot via the SQLite backup API (safe while the bot runs).
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp_path)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        with open(tmp_path, "rb") as fh:
+            await context.bot.send_document(
+                msg.chat_id,
+                document=InputFile(fh, filename=f"bot_data_{ts}.db"),
+                caption=f"📦 Database backup · {ts}",
+            )
+        logger.info("DB backup sent to admin %s", msg.from_user.id)
+    except Exception as e:
+        logger.error("cmd_backup failed: %s", e, exc_info=True)
+        await msg.reply_text(f"❌ Backup failed: {e}")
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /restore — arm the bot to replace the DB with the next uploaded .db file."""
+    msg = update.message
+    if msg.chat.type != "private":
+        await msg.reply_text("📥 Restore only works in private chat with the bot.")
+        return
+    if msg.from_user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("⛔ You are not authorised to use this command.")
+        return
+
+    _awaiting_restore.add(msg.from_user.id)
+    await msg.reply_text(
+        "📥 *Restore armed.*\n\n"
+        "Now upload the `.db` file that should replace the current database.\n"
+        "The current DB is backed up first. Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /cancel — disarm a pending /restore."""
+    msg = update.message
+    if msg.chat.type != "private" or msg.from_user.id not in ADMIN_USER_IDS:
+        return
+    if msg.from_user.id in _awaiting_restore:
+        _awaiting_restore.discard(msg.from_user.id)
+        await msg.reply_text("✖️ Restore cancelled.")
+
+
+async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Group -1 handler: when an admin who ran /restore uploads a document in DM, validate
+    it and atomically swap the live DB. If the admin is not in a restore flow, return
+    quietly so the normal group-0 handlers process the message as usual.
+    """
+    msg = update.message
+    if not msg or not msg.document:
+        return
+    admin_id = msg.from_user.id
+    if admin_id not in _awaiting_restore:
+        return  # not restoring — let normal handlers run
+
+    incoming = f"{DB_PATH}.incoming"
+    try:
+        tg_file = await context.bot.get_file(msg.document.file_id)
+        await tg_file.download_to_drive(custom_path=incoming)
+
+        ok, detail = _is_valid_sqlite(incoming)
+        if not ok:
+            await msg.reply_text(
+                f"❌ Rejected: {detail}\nThe database was *not* changed. Upload a valid `.db` or send /cancel.",
+                parse_mode="Markdown",
+            )
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{DB_PATH}.prerestore_{ts}"
+            if os.path.exists(DB_PATH):
+                shutil.copy2(DB_PATH, backup_path)
+            # Drop stale WAL/SHM sidecars so they don't shadow the restored file.
+            for sidecar in (f"{DB_PATH}-wal", f"{DB_PATH}-shm"):
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
+            os.replace(incoming, DB_PATH)  # atomic (same filesystem)
+            init_db()                      # ensure schema on the restored file
+            _awaiting_restore.discard(admin_id)
+            await msg.reply_text(
+                f"✅ *Database restored.*\nPrevious DB saved on the server as `{os.path.basename(backup_path)}`.",
+                parse_mode="Markdown",
+            )
+            logger.info("DB restored by admin %s (previous saved as %s)", admin_id, backup_path)
+    except Exception as e:
+        logger.error("handle_admin_document (restore) failed: %s", e, exc_info=True)
+        await msg.reply_text(f"❌ Restore failed: {e}\nThe database was not changed.")
+    finally:
+        if os.path.exists(incoming):
+            try:
+                os.remove(incoming)
+            except OSError:
+                pass
+
+    # We consumed this upload as a restore attempt — don't let it open a support ticket.
+    raise ApplicationHandlerStop
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 11. Callback query handler (inline keyboard noop)
 # ──────────────────────────────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1111,6 +1270,21 @@ async def _ptb_setup_and_run() -> None:
     # ── Admin commands (private DM) ──
     ptb_application.add_handler(CommandHandler("stats",     cmd_stats))
     ptb_application.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    ptb_application.add_handler(CommandHandler("backup",    cmd_backup))
+    ptb_application.add_handler(CommandHandler("restore",   cmd_restore))
+    ptb_application.add_handler(CommandHandler("cancel",    cmd_cancel))
+
+    # ── Admin DB restore: intercept an uploaded .db in DM BEFORE the ticket handler ──
+    # group=-1 runs ahead of the group-0 user-message handler; it raises
+    # ApplicationHandlerStop once it consumes a restore upload.
+    if ADMIN_USER_IDS:
+        ptb_application.add_handler(
+            MessageHandler(
+                filters.ChatType.PRIVATE & filters.User(user_id=ADMIN_USER_IDS) & filters.Document.ALL,
+                handle_admin_document,
+            ),
+            group=-1,
+        )
 
     # ── Admin commands (group topic) ──
     group_cmd_filter = filters.Chat(GROUP_ID) & filters.UpdateType.MESSAGE
@@ -1146,7 +1320,12 @@ async def _ptb_setup_and_run() -> None:
     await ptb_application.initialize()
     logger.info("PTB application initialised.")
 
-    await set_webhook()
+    if USE_POLLING:
+        await ptb_application.start()
+        await ptb_application.updater.start_polling(drop_pending_updates=True)
+        logger.info("PTB polling started.")
+    else:
+        await set_webhook()
     logger.info("PTB setup complete. Loop running forever.")
 
 
