@@ -52,7 +52,7 @@ ADMIN_USER_IDS = [
     for x in os.getenv("TELEGRAM_ADMINS", "").split(",")
     if x.strip()
 ]
-PORT           = int(os.getenv("PORT", "8443"))
+PORT           = int(os.getenv("PORT") or "8443")
 WEBSITE_URL    = os.getenv("WEBSITE_URL", "")
 USE_POLLING    = os.getenv("USE_POLLING", "").lower() in ("1", "true", "yes")
 DB_PATH        = os.getenv("DB_PATH", "bot_data.db")
