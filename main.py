@@ -32,7 +32,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, InputFile
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, InputFile,
+    BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat,
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -77,6 +78,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# Suppress httpx's per-request INFO lines (getUpdates 200 OK every ~10s in polling mode).
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 if not ADMIN_USER_IDS:
     logger.warning("TELEGRAM_ADMINS is empty — admin commands will not work.")
@@ -1045,6 +1048,38 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await msg.reply_text("✖️ Restore cancelled.")
 
 
+async def cmd_cleardb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /cleardb confirm — wipe the database and start fresh."""
+    msg = update.message
+    if msg.chat.type != "private":
+        await msg.reply_text("This command only works in private chat with the bot.")
+        return
+    if msg.from_user.id not in ADMIN_USER_IDS:
+        await msg.reply_text("⛔ You are not authorised to use this command.")
+        return
+    if not context.args or context.args[0].lower() != "confirm":
+        await msg.reply_text(
+            "⚠️ *This will permanently delete all user sessions and data.*\n\n"
+            "To confirm, send:\n`/cleardb confirm`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        for path in (DB_PATH, f"{DB_PATH}-wal", f"{DB_PATH}-shm"):
+            if os.path.exists(path):
+                os.remove(path)
+        init_db()
+        logger.warning("Database wiped by admin %s.", msg.from_user.id)
+        await msg.reply_text(
+            "🗑️ *Database cleared.* The bot has been reset to a fresh state.\n"
+            "All user sessions and history are gone.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error("cmd_cleardb failed: %s", e, exc_info=True)
+        await msg.reply_text(f"❌ Failed to clear database: {e}")
+
+
 async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Group -1 handler: when an admin who ran /restore uploads a document in DM, validate
@@ -1255,7 +1290,51 @@ async def set_webhook() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 14. PTB setup & dedicated event loop thread
+# 14. Bot command registration
+# ──────────────────────────────────────────────────────────────────────────────
+async def _register_bot_commands() -> None:
+    """Push the command menu to Telegram for user/admin/group scopes."""
+    user_cmds = [
+        BotCommand("start", "Start or resume your support session"),
+        BotCommand("help",  "Show help and available commands"),
+        BotCommand("close", "Close your active support session"),
+    ]
+    admin_cmds = user_cmds + [
+        BotCommand("stats",     "Show bot statistics"),
+        BotCommand("broadcast", "Send a message to all users"),
+        BotCommand("backup",    "Download a database backup"),
+        BotCommand("restore",   "Replace the database with an uploaded file"),
+        BotCommand("cleardb",   "Wipe the database and start fresh"),
+        BotCommand("cancel",    "Cancel a pending restore"),
+    ]
+    group_cmds = [
+        BotCommand("close", "Resolve and close this support ticket"),
+        BotCommand("ban",   "Ban the user linked to this topic"),
+        BotCommand("unban", "Unban the user linked to this topic"),
+    ]
+
+    await ptb_application.bot.set_my_commands(user_cmds, scope=BotCommandScopeAllPrivateChats())
+
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await ptb_application.bot.set_my_commands(
+                admin_cmds, scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+        except Exception as e:
+            logger.warning("Could not set admin commands for %s: %s", admin_id, e)
+
+    try:
+        await ptb_application.bot.set_my_commands(
+            group_cmds, scope=BotCommandScopeChat(chat_id=GROUP_ID)
+        )
+    except Exception as e:
+        logger.warning("Could not set group commands: %s", e)
+
+    logger.info("Bot commands registered.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 15. PTB setup & dedicated event loop thread  (was 14)
 # ──────────────────────────────────────────────────────────────────────────────
 async def _ptb_setup_and_run() -> None:
     """Initialise DB, register handlers, set webhook, and keep PTB loop alive."""
@@ -1273,6 +1352,7 @@ async def _ptb_setup_and_run() -> None:
     ptb_application.add_handler(CommandHandler("backup",    cmd_backup))
     ptb_application.add_handler(CommandHandler("restore",   cmd_restore))
     ptb_application.add_handler(CommandHandler("cancel",    cmd_cancel))
+    ptb_application.add_handler(CommandHandler("cleardb",   cmd_cleardb))
 
     # ── Admin DB restore: intercept an uploaded .db in DM BEFORE the ticket handler ──
     # group=-1 runs ahead of the group-0 user-message handler; it raises
@@ -1326,6 +1406,8 @@ async def _ptb_setup_and_run() -> None:
         logger.info("PTB polling started.")
     else:
         await set_webhook()
+
+    await _register_bot_commands()
     logger.info("PTB setup complete. Loop running forever.")
 
 
