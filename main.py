@@ -32,7 +32,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request as flask_request
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, InputFile,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
     BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat,
 )
 from telegram.ext import (
@@ -59,6 +59,15 @@ USE_POLLING    = os.getenv("USE_POLLING", "").lower() in ("1", "true", "yes")
 DB_PATH        = os.getenv("DB_PATH", "bot_data.db")
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "10"))  # seconds
+
+# How often (seconds) to reassure a user that their message was received. A single
+# debounced text — NOT a per-message reaction — so users know a human will reply
+# without the bot appearing to "react" to every line. 0 disables the ack entirely.
+ACK_COOLDOWN   = int(os.getenv("ACK_COOLDOWN", "1800"))  # 30 min
+# Expected reply window shown to users so they don't expect an instant response.
+RESPONSE_TIME  = os.getenv("RESPONSE_TIME", "within a few hours")
+# Optional office-hours line appended to the welcome message (blank = omitted).
+OFFICE_HOURS   = os.getenv("OFFICE_HOURS", "")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Validation
@@ -114,6 +123,32 @@ def is_rate_limited(chat_id: int) -> bool:
         return False
 
 
+# ── Delivery acknowledgement debounce ──────────────────────────────────────────
+# Tracks the last time we sent a "message received" text to each user, so we send
+# it at most once per ACK_COOLDOWN window instead of reacting to every message.
+_last_ack: dict[int, float] = {}
+
+
+def should_ack(chat_id: int) -> bool:
+    """Return True if enough time has passed to reassure this user again (and stamp now).
+    Always False when ACK_COOLDOWN <= 0 (feature disabled)."""
+    if ACK_COOLDOWN <= 0:
+        return False
+    now = time.monotonic()
+    with _rate_lock:
+        last = _last_ack.get(chat_id, 0.0)
+        if now - last < ACK_COOLDOWN:
+            return False
+        _last_ack[chat_id] = now
+        return True
+
+
+ACK_TEXT = (
+    "✅ *Message received.*\n"
+    f"Our team will reply right here — typical response time is {RESPONSE_TIME}."
+)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. Database
 # ──────────────────────────────────────────────────────────────────────────────
@@ -137,6 +172,12 @@ def init_db() -> None:
             is_closed       INTEGER NOT NULL DEFAULT 0,
             created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
             last_message_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ratings (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id    INTEGER NOT NULL,
+            rating     INTEGER NOT NULL,
+            created_at TEXT    NOT NULL DEFAULT (datetime('now'))
         );
     """)
     conn.commit()
@@ -263,6 +304,19 @@ def get_all_users() -> list[dict]:
         return []
 
 
+def save_rating(chat_id: int, rating: int) -> None:
+    try:
+        conn = _connect()
+        conn.execute(
+            "INSERT INTO ratings (chat_id, rating) VALUES (?, ?)",
+            (chat_id, rating),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        logger.error("save_rating: %s", e)
+
+
 def get_stats() -> dict:
     try:
         conn = _connect()
@@ -276,12 +330,19 @@ def get_stats() -> dict:
         today_msg = conn.execute(
             "SELECT COUNT(*) FROM users WHERE date(last_message_at)=date('now')"
         ).fetchone()[0]
+        rating_row = conn.execute(
+            "SELECT AVG(rating), COUNT(*) FROM ratings"
+        ).fetchone()
         conn.close()
+        avg_rating = round(rating_row[0], 2) if rating_row and rating_row[0] is not None else None
+        rating_count = rating_row[1] if rating_row else 0
         return {
             "total": total,
             "active": active,
             "banned": banned,
             "today_messages": today_msg,
+            "avg_rating": avg_rating,
+            "rating_count": rating_count,
         }
     except sqlite3.Error as e:
         logger.error("get_stats: %s", e)
@@ -398,7 +459,7 @@ WELCOME_TEXT = (
     "💬 *How it works:*\n"
     "1. Type your message and hit send.\n"
     "2. Our support team will receive it and reply directly.\n"
-    "3. We aim to respond within a few hours.\n\n"
+    f"3. We aim to respond {RESPONSE_TIME}.\n\n"
     "📌 *Supported Media:*\n"
     "• Text & Links\n"
     "• Photos & Videos\n"
@@ -407,20 +468,28 @@ WELCOME_TEXT = (
     "• Locations & Contacts\n\n"
     "⚙️ *Available Commands:*\n"
     "• /start — Restart support session\n"
-    "• /close — Close your active session\n"
     "• /help  — View help instructions"
+    "{office_hours}"
 )
 
 HELP_TEXT = (
     "ℹ️ *Support Bot Guide*\n\n"
     "This bot acts as a direct line to our support team. "
     "Every message you send here is relayed directly to our staff.\n\n"
+    f"⏱️ We aim to reply *{RESPONSE_TIME}*. A support member will close your "
+    "ticket once it's resolved.\n\n"
     "⌨️ *Commands:*\n"
     "• /start — Start or resume your support session\n"
-    "• /close — Close your active session\n"
     "• /help  — Display this guide\n\n"
     "💡 _Simply type a message and press send to get in touch!_"
 )
+
+# Optional office-hours line, formatted into WELCOME_TEXT's trailing slot.
+_OFFICE_HOURS_LINE = f"\n\n🕒 *Support hours:* {OFFICE_HOURS}" if OFFICE_HOURS else ""
+
+
+def welcome_text(name: str) -> str:
+    return WELCOME_TEXT.format(name=name, office_hours=_OFFICE_HOURS_LINE)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -466,8 +535,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not row["is_closed"]:
             kb = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help"),
-                    InlineKeyboardButton("🔒 Close Session", callback_data=f"user_close:{chat_id}:{thread_id}")
+                    InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help")
                 ]
             ])
             await msg.reply_text(
@@ -484,12 +552,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             thread_id = row["thread_id"]
             kb = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help"),
-                    InlineKeyboardButton("🔒 Close Session", callback_data=f"user_close:{chat_id}:{thread_id}")
+                    InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help")
                 ]
             ])
             await msg.reply_text(
-                WELCOME_TEXT.format(name=username),
+                welcome_text(username),
                 parse_mode="Markdown",
                 reply_markup=kb,
             )
@@ -531,12 +598,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help"),
-                InlineKeyboardButton("🔒 Close Session", callback_data=f"user_close:{chat_id}:{thread_id}")
+                InlineKeyboardButton("ℹ️ Help Guide", callback_data="user_help")
             ]
         ])
         await msg.reply_text(
-            WELCOME_TEXT.format(name=username),
+            welcome_text(username),
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -580,36 +646,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
-async def cmd_user_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """User command: /close — close their own support session from PM."""
-    msg = update.message
-    chat_id = msg.chat_id
-
-    row = get_user_row(chat_id)
-    if not row or not row["thread_id"] or row["is_closed"]:
-        await msg.reply_text("⚠️ You do not have an active support session.")
-        return
-
-    thread_id = row["thread_id"]
-    set_closed(chat_id, True)
-
-    await msg.reply_text(
-        "✅ *Your support session has been closed.*\n\n"
-        "If you need help in the future, just send a new message or run /start.",
-        parse_mode="Markdown"
-    )
-
-    # Notify admin group
-    try:
-        await context.bot.send_message(
-            GROUP_ID,
-            "🔒 *Ticket closed by the user.*",
-            message_thread_id=thread_id,
-            parse_mode="Markdown"
-        )
-        await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
-    except Exception as e:
-        logger.warning("cmd_user_close: could not notify group or close topic: %s", e)
+# NOTE: Closing a ticket is intentionally admin-only. Users cannot close their own
+# sessions (no /close command, no "Close Session" button) — only an admin resolves a
+# ticket via /close or the "Resolve & Close" button inside the group topic.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -666,15 +705,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         forwarded = await forward_to_group(context, msg, thread_id)
         if forwarded:
             touch_last_message(chat_id)
-            # Delivery receipt: react with 👍
-            try:
-                await context.bot.set_message_reaction(
-                    chat_id=chat_id,
-                    message_id=msg.message_id,
-                    reaction=[ReactionTypeEmoji("👍")],
-                )
-            except Exception:
-                pass  # Reactions may not be supported in all clients — silently ignore
+            # Debounced reassurance: a real "received" text (not a reaction, which users
+            # mistake for a live human), sent at most once per ACK_COOLDOWN window.
+            if should_ack(chat_id):
+                try:
+                    await msg.reply_text(ACK_TEXT, parse_mode="Markdown")
+                except Exception:
+                    pass
         else:
             await msg.reply_text("⚠️ This message type isn't supported yet.")
     except BadRequest as e:
@@ -716,14 +753,11 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 forwarded = await forward_to_group(context, msg, new_thread_id)
                 if forwarded:
                     touch_last_message(chat_id)
-                    try:
-                        await context.bot.set_message_reaction(
-                            chat_id=chat_id,
-                            message_id=msg.message_id,
-                            reaction=[ReactionTypeEmoji("👍")],
-                        )
-                    except Exception:
-                        pass
+                    if should_ack(chat_id):
+                        try:
+                            await msg.reply_text(ACK_TEXT, parse_mode="Markdown")
+                        except Exception:
+                            pass
                 else:
                     await msg.reply_text("⚠️ This message type isn't supported yet.")
             except Exception as re_err:
@@ -771,6 +805,33 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 # ──────────────────────────────────────────────────────────────────────────────
 # 10. Admin commands (issued inside a group topic)
 # ──────────────────────────────────────────────────────────────────────────────
+def _rating_keyboard() -> InlineKeyboardMarkup:
+    """1–5 star inline keyboard shown to a user after their ticket is resolved."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⭐", callback_data="rate:1"),
+        InlineKeyboardButton("⭐⭐", callback_data="rate:2"),
+        InlineKeyboardButton("⭐⭐⭐", callback_data="rate:3"),
+        InlineKeyboardButton("⭐⭐⭐⭐", callback_data="rate:4"),
+        InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data="rate:5"),
+    ]])
+
+
+async def _send_rating_prompt(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int) -> None:
+    """Ask the user to rate the support they received. Best-effort; ignores blocks."""
+    try:
+        await context.bot.send_message(
+            user_chat_id,
+            "⭐ *How was your support experience?*\n"
+            "Tap a rating below — it helps us improve.",
+            parse_mode="Markdown",
+            reply_markup=_rating_keyboard(),
+        )
+    except Forbidden:
+        pass
+    except Exception as e:
+        logger.warning("_send_rating_prompt: could not prompt user %s: %s", user_chat_id, e)
+
+
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin command: /close — resolve and close the current support ticket."""
     msg       = update.message
@@ -798,6 +859,9 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except Forbidden:
         logger.warning("cmd_close: bot blocked by user %s", user_chat_id)
+
+    # Ask for a rating
+    await _send_rating_prompt(context, user_chat_id)
 
     # Close the forum topic
     try:
@@ -894,12 +958,19 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     s = get_stats()
+    avg = s.get("avg_rating")
+    rating_line = (
+        f"\n⭐ Avg rating:     *{avg}/5* ({s.get('rating_count', 0)} ratings)"
+        if avg is not None else
+        "\n⭐ Avg rating:     *no ratings yet*"
+    )
     text = (
         "📊 *Support Bot Statistics*\n\n"
         f"👥 Total sessions: *{s.get('total', 0)}*\n"
         f"✅ Active sessions: *{s.get('active', 0)}*\n"
         f"🚫 Banned users:   *{s.get('banned', 0)}*\n"
         f"💬 Active today:   *{s.get('today_messages', 0)}*"
+        f"{rating_line}"
     )
     await msg.reply_text(text, parse_mode="Markdown")
 
@@ -1157,36 +1228,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # User close ticket request
-    if data.startswith("user_close:"):
-        parts = data.split(":")
-        target_chat_id = int(parts[1])
-        thread_id = int(parts[2])
-
-        row = get_user_row(target_chat_id)
-        if row and not row["is_closed"]:
-            set_closed(target_chat_id, True)
-
+    # User feedback rating after an admin closes their ticket
+    if data.startswith("rate:"):
+        try:
+            rating = int(data.split(":")[1])
+        except (IndexError, ValueError):
+            await query.answer()
+            return
+        if not 1 <= rating <= 5:
+            await query.answer()
+            return
+        save_rating(user_id, rating)
+        await query.answer("Thanks for your feedback!")
+        try:
             await query.edit_message_text(
-                "✅ *Your support ticket has been closed.*\n\n"
-                "Thank you! Feel free to send a message or run /start to open a new session.",
-                parse_mode="Markdown"
+                f"🙏 *Thank you for rating our support {'⭐' * rating}!*\n\n"
+                "Your feedback helps us improve. Send a message any time to open a new ticket.",
+                parse_mode="Markdown",
             )
-
-            # Notify admins in group
-            try:
-                await context.bot.send_message(
-                    GROUP_ID,
-                    "🔒 *Ticket closed by the user.*",
-                    message_thread_id=thread_id,
-                    parse_mode="Markdown"
-                )
-                await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
-            except Exception as e:
-                logger.warning("user_close callback: failed to close thread/notify: %s", e)
-            await query.answer("Support ticket closed.")
-        else:
-            await query.answer("Your ticket is already closed.")
+        except Exception:
+            pass
         return
 
     # Verify admin permissions for admin actions
@@ -1212,6 +1273,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
             except Forbidden:
                 pass
+
+            # Ask for a rating
+            await _send_rating_prompt(context, target_chat_id)
 
             try:
                 await context.bot.close_forum_topic(chat_id=GROUP_ID, message_thread_id=thread_id)
@@ -1297,7 +1361,6 @@ async def _register_bot_commands() -> None:
     user_cmds = [
         BotCommand("start", "Start or resume your support session"),
         BotCommand("help",  "Show help and available commands"),
-        BotCommand("close", "Close your active support session"),
     ]
     admin_cmds = user_cmds + [
         BotCommand("stats",     "Show bot statistics"),
@@ -1341,10 +1404,9 @@ async def _ptb_setup_and_run() -> None:
     init_db()
 
     # ── User commands ──
+    # Note: there is intentionally no user /close — closing is admin-only.
     ptb_application.add_handler(CommandHandler("start", cmd_start))
     ptb_application.add_handler(CommandHandler("help",  cmd_help))
-    user_cmd_filter = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
-    ptb_application.add_handler(CommandHandler("close", cmd_user_close, filters=user_cmd_filter))
 
     # ── Admin commands (private DM) ──
     ptb_application.add_handler(CommandHandler("stats",     cmd_stats))
